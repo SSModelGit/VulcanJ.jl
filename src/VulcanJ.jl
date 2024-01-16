@@ -6,6 +6,9 @@ import Random
 import Printf
 
 # Write your package code here.
-include("Ascent_Ex.jl")
+include("AscentEx.jl")
+include("InformationStates.jl")
+
+export trial_func
 
 end
