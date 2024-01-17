@@ -1,14 +1,15 @@
 module VulcanJ
 
-import POMDPs
+using Reexport
 import MCTS
-import Random
-import Printf
 
 # Write your package code here.
 include("ascent_example.jl")
 include("measurement.jl")
-include("InformationStates.jl")
+include("InformationMDP.jl")
+
+@reexport using .EnvironmentGP
+@reexport using .InformationMDP
 
 export trial_func
 
