@@ -1,11 +1,11 @@
 module VulcanJ
 
 using Reexport
-import MCTS
+#import MCTS
 
 # Write your package code here.
 include("ascent_example.jl")
-include("measurement.jl")
+include("EnvironmentGP.jl")
 include("InformationMDP.jl")
 
 @reexport using .EnvironmentGP

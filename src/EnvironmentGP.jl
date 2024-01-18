@@ -9,10 +9,16 @@ end
 
 EnvNode(;dim=2) = EnvNode(0.0,GPE(Matrix{Float64}(undef,dim,0),Float64[],MeanZero(),SE(zeros(dim),0.0)))
 
-update_observations(env::EnvNode, X::Matrix, info::Float64) = GP(hcat(env.gp.x,float(X)),hcat(gp.env.y, info),env.gp.mean,env.gp.kernel)
+function update_observations(gp::GPE, X::Matrix, info::Float64)
+    let gp=GP(hcat(gp.x,float(X)),vcat(gp.y, info),gp.mean,gp.kernel)
+        optimize!(gp)
+        gp
+    end
+end
+update_observations(env::EnvNode, X::Matrix, info::Float64) = update_observations(env.gp, X, info)
 
-predict_env(env::EnvNode, env_sites::Matrix{Float64}) = predict_f(env.gp, env_sites)
+predict_gp(gp::GPE, env_sites::Matrix{Float64}) = predict_f(gp, env_sites)
 
-export EnvNode, update_observations, predict_env
+export EnvNode, update_observations, predict_gp
 
 end
