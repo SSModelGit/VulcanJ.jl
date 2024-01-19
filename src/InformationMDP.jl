@@ -1,6 +1,8 @@
 module InformationMDP
 
-import POMDPs
+using POMDPs
+using POMDPTools: SparseCat
+using Random: AbstractRNG
 using FastGaussQuadrature: gausshermite
 using SpecialFunctions: erf
 using StatsBase: Weights, sample
@@ -23,21 +25,23 @@ struct InfoNode <: VulcanNode
 end
 
 ###  MDP Construct
-mutable struct InfoProblem <: POMDPs.MDP{InfoNode, Symbol}
+mutable struct InfoProblem <: MDP{InfoNode, Matrix{Int64}}
     Xlims::Vector{Int64} # width and height limits of the world
     ū::Float64 # threshold for phenomena discovery
     p̄::Vector{Float64} # probability of phenom. when less and greater than u_bar
     abcissae::Vector{Float64} # roots of Gauss-Hermite Quadrature (via FastGaussQuadrature)
     weights::Vector{Float64} # corresponding weights of VulcanWorld.abcissae
     discount_factor::Float64 # discount factor (default: 1)
+    Xinit::InitialNode # initial state location (default: [1;1;;])
 end
 
 function InfoProblem(;sxy::Vector{Int64}=[10,10],
                       ū::Float64=0.5,
                       p̄::Vector{Float64}=[0.3,0.6],
                       gh_deg::Int64=5,
-                      gamma::Float64 = 1.0)
-    return InfoProblem(sxy,ū,p̄,gausshermite(gh_deg)...,gamma)
+                      gamma::Float64 = 1.0,
+                      Xinit::Matrix{Int64} = [1;1;;])
+    return InfoProblem(sxy,ū,p̄,gausshermite(gh_deg)...,gamma,InitialNode(Xinit))
 end
 
 cellsites(p::InfoProblem) = stack([[float(x),float(y)] for x in 1:p.Xlims[1] for y in 1:p.Xlims[2]], dims=2);
@@ -54,24 +58,29 @@ cellsites(p::InfoProblem) = stack([[float(x),float(y)] for x in 1:p.Xlims[1] for
 ## Core Information Updates
 """Return a sample from the distribution of abcissae under Gauss-Hermite quadrature.
 """
-sample_y_j(p::InfoProblem) = √2 * sample(p.abcissae, Weights(p.weights./sqrt(π)))
+sample_y_j(p::InfoProblem, rng) = √2 * sample(rng, p.abcissae, Weights(p.weights./sqrt(π)))
 """Return the mean and variance at a particular location given an environment node.
 """
 μΣ_point(X::Matrix{Float64}, env::EnvNode) = map(x->x[1],predict_gp(env.gp, X))
 """Return mean-variance-corrected sample of the environment at specified location using Gauss-Hermite quadrature estimation.
 """
-gh_env_sample(X::Matrix{Float64}, env::EnvNode, p::InfoProblem) = let (μ,Σ)=μΣ_point(X,env); μ+√Σ*sample_y_j(p); end
+gh_env_sample(X::Matrix{Float64}, env::EnvNode, p::InfoProblem, rng=Random.GLOBAL_RNG) = let (μ,Σ)=μΣ_point(X,env); μ+√Σ*sample_y_j(p, rng); end
 
 ## Core Dynamics Updates
+"""Vector of valid actions for an InitialNode state node.
+
+There is only one valid action."""
+valid_actions(n::InitialNode, p::InfoProblem) = [[0;0;;]]
+
 """ Returns vector of valid actions (movement vectors) that do not violate boundary counditions listed in the MDP problem description.
 
     Arguments:
-        n::VulcanNode - Node with a position description. Typically only InfoNode, but using general VulcanNode for correctness.
+        n::InfoNode - Node with a position description.
         p::InfoProblem - MDP problem definition container.
     Returns:
         a_list::Vector{Matrix{Int64}} - List of valid possible actions from current node `n`.
 """
-valid_actions(n::VulcanNode, p::InfoProblem) = [[x;y;;] for x in -1:1 if 0<n.X[1]+x≤p.Xlims[1] for y in -1:1 if (0<n.X[2]+y≤p.Xlims[2] && x*y+x+y≠0)]
+valid_actions(n::InfoNode, p::InfoProblem) = [[x;y;;] for x in -1:1 if 0<n.X[1]+x≤p.Xlims[1] for y in -1:1 if (0<n.X[2]+y≤p.Xlims[2] && x*y+x+y≠0)]
 
 
 """Naive successor constructor for the InitialNode state. Should only be ever called on the initial node.
@@ -80,12 +89,13 @@ Does not account for prior information before sampling (assumes initial process 
 
     Arguments:
         node::InitialNode - The root node of the search. Based at a particular location, without any additional information.
+        a::Matrix{Int64} - Action direction. Only one valid action is allowed ([0.;0.;;] - staying in place).
         p::InfoProblem - MDP problem definition container.
     Returns:
         ns::InfoNode - A node at the same position as `node`, but with information value taken from a simple Gauss-Hermite curve approximation.
             - Contains an empty GP as well, using a SEard kernel (matching the dimensions of the position matrix.)
 """
-make_successor(node::InitialNode, p::InfoProblem) = InfoNode(node.X, sample_y_j(p), Δmutual_info_up(node))
+make_successor(node::InitialNode, a::Matrix{Int64}, p::InfoProblem, rng=Random.GLOBAL_RNG) = InfoNode(node.X+a, sample_y_j(p, rng), Δmutual_info_up(node))
 
 """Successor constructor for the InfoNode state.
 
@@ -105,9 +115,9 @@ The update does the following:
     Returns:
         ns::InfoNode - The next state node succeeding the current state node, based on the action provided and problem definition.
 """
-function make_successor(node::InfoNode, action::Matrix{Int64}, p::InfoProblem)
+function make_successor(node::InfoNode, action::Matrix{Int64}, p::InfoProblem, rng=Random.GLOBAL_RNG)
     let Xnew=node.X+action, env=Δmutual_info_up(node, p)
-        InfoNode(Xnew, gh_env_sample(float(Xnew),env,p), env)
+        InfoNode(Xnew, gh_env_sample(float(Xnew),env,p, rng), env)
     end
 end
 
@@ -195,6 +205,9 @@ function Δmutual_info_up(node::InfoNode, p::InfoProblem)
     end
 end
 
+δmi(n::InfoNode) = n.env.δmi
+δmi(n::InitialNode) = 0.0
+
 #### [TODO: Fix the estimate_value function approach to be better, potentially]
 ######## Differences from original
 ### Original Vulcan included the prior history for full life-time reward
@@ -202,6 +215,6 @@ end
 ### This makes the V[curr] = r + V[next] update for MDPs very feasible
 ########
 
-export InitialNode, valid_actions, make_successor, InfoNode, InfoProblem, cellsites, Δmutual_info_up
+export VulcanNode, InitialNode, InfoNode, InfoProblem, valid_actions, make_successor, δmi, cellsites, Δmutual_info_up
 
 end
