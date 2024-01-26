@@ -1,7 +1,6 @@
 module InformationMDP
 
 using POMDPs
-using POMDPTools: SparseCat
 using Random: AbstractRNG
 using FastGaussQuadrature: gausshermite
 using SpecialFunctions: erf
@@ -15,14 +14,18 @@ abstract type VulcanNode end
 
 struct InitialNode <: VulcanNode
     X::Matrix{Int64}
+    env::EnvNode
 end
 
 struct InfoNode <: VulcanNode
     X::Matrix{Int64} # grid world coordinates - deterministic update
     info::Float64 # Observation that we've transitioned into - pseudo-nondeterministic update, use Gauss-Hermite weights for probs
-    env::EnvNode # 
-    # gp::Bool # Fake Gaussian Process (Boolean) - update this during transitions to incorporate the "info" of the current state as a new measurement
+    env::EnvNode # Gaussian Process (Boolean) - updated during transitions to incorporate the "info" of the current state as a new measurement
 end
+
+initialize_start(Xinit::Matrix{Int64}) = InitialNode(Xinit, EnvNode(size(Xinit)[1]))
+initialize_start(Xinit::Matrix{Int64}, prior::Dict{Symbol, Array{Float64}}) = InitialNode(Xinit, EnvNode(prior))
+initialize_start(Xinit::Matrix{Int64}, prior::Dict{Symbol, Array{Float64}}, obs::Float64) = InfoNode(Xinit, obs, EnvNode(prior))
 
 ###  MDP Construct
 mutable struct InfoProblem <: MDP{InfoNode, Matrix{Int64}}
@@ -32,7 +35,7 @@ mutable struct InfoProblem <: MDP{InfoNode, Matrix{Int64}}
     abcissae::Vector{Float64} # roots of Gauss-Hermite Quadrature (via FastGaussQuadrature)
     weights::Vector{Float64} # corresponding weights of VulcanWorld.abcissae
     discount_factor::Float64 # discount factor (default: 1)
-    Xinit::InitialNode # initial state location (default: [1;1;;])
+    Xinit::VulcanNode # initial state location (default: InitialNode([1;1;;]))
 end
 
 function InfoProblem(;sxy::Vector{Int64}=[10,10],
@@ -40,8 +43,23 @@ function InfoProblem(;sxy::Vector{Int64}=[10,10],
                       p̄::Vector{Float64}=[0.3,0.6],
                       gh_deg::Int64=5,
                       gamma::Float64 = 1.0,
-                      Xinit::Matrix{Int64} = [1;1;;])
-    return InfoProblem(sxy,ū,p̄,gausshermite(gh_deg)...,gamma,InitialNode(Xinit))
+                      initial_info::Dict)
+    let yesX = haskey(initial_info, :Xinit), yesprior = haskey(initial_info, :prior), yesobs = haskey(initial_info, :obs), Xinit
+        if yesX
+            if yesprior
+                if yesobs
+                    Xinit = initialize_start(initial_info[:Xinit], initial_info[:prior], initial_info[:obs])
+                else
+                    Xinit = initialize_start(initial_info[:Xinit], initial_info[:prior])
+                end
+            else
+                Xinit = initialize_start(initial_info[:Xinit])
+            end
+        else
+            return @error "Incorrect initial information provided. Please double-check docstring."
+        end
+        return InfoProblem(sxy,ū,p̄,gausshermite(gh_deg)...,gamma,Xinit)
+    end
 end
 
 cellsites(p::InfoProblem) = stack([[float(x),float(y)] for x in 1:p.Xlims[1] for y in 1:p.Xlims[2]], dims=2);
@@ -72,7 +90,10 @@ gh_env_sample(X::Matrix{Float64}, env::EnvNode, p::InfoProblem, rng=Random.GLOBA
 There is only one valid action."""
 valid_actions(n::InitialNode, p::InfoProblem) = [[0;0;;]]
 
-""" Returns vector of valid actions (movement vectors) that do not violate boundary counditions listed in the MDP problem description.
+"""
+    valid_actions(n::InfoNode, p::InfoProblem)
+
+ Returns vector of valid actions (movement vectors) that do not violate boundary counditions listed in the MDP problem description.
 
     Arguments:
         n::InfoNode - Node with a position description.
@@ -83,7 +104,10 @@ valid_actions(n::InitialNode, p::InfoProblem) = [[0;0;;]]
 valid_actions(n::InfoNode, p::InfoProblem) = [[x;y;;] for x in -1:1 if 0<n.X[1]+x≤p.Xlims[1] for y in -1:1 if (0<n.X[2]+y≤p.Xlims[2] && x*y+x+y≠0)]
 
 
-"""Naive successor constructor for the InitialNode state. Should only be ever called on the initial node.
+"""
+    make_successor(node::InitialNode, a::Matrix{Int64}, p::InfoProblem, rng=Random.GLOBAL_RNG)
+
+Naive successor constructor for the InitialNode state. Should only be ever called on the initial node.
 
 Does not account for prior information before sampling (assumes initial process model with zero-mean, 1-cov). Reward of transition is always zero.
 
@@ -97,7 +121,10 @@ Does not account for prior information before sampling (assumes initial process 
 """
 make_successor(node::InitialNode, a::Matrix{Int64}, p::InfoProblem, rng=Random.GLOBAL_RNG) = InfoNode(node.X+a, sample_y_j(p, rng), Δmutual_info_up(node))
 
-"""Successor constructor for the InfoNode state.
+"""
+    make_successor(node::InfoNode, action::Matrix{Int64}, p::InfoProblem, rng=Random.GLOBAL_RNG)
+
+Successor constructor for the InfoNode state.
 
 The update does the following:
 
@@ -181,7 +208,7 @@ Hence, there is no reward in this transition. This is equivalent to r[t=-1], whi
     Returns:
         env::EnvNode = (0.0, GPE(MeanZero(),SEard(0.0,0.0,0.0))). Always zero reward.
 """
-Δmutual_info_up(node::InitialNode) = EnvNode(dim=size(node.X)[1])
+Δmutual_info_up(node::InitialNode) = node.env
 
 """Immediate mutual information update after sampling from the given state node. Returns an updated environment node.
 
