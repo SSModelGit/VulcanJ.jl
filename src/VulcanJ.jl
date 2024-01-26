@@ -7,7 +7,7 @@ using Reexport
 include("ascent_example.jl")
 include("EnvironmentGP.jl")
 include("InformationMDP.jl")
-include("spinup_pomdp.jl")
+include("spinup_infomdp.jl")
 
 @reexport using .EnvironmentGP
 @reexport using .InformationMDP
