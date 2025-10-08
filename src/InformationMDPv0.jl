@@ -103,7 +103,6 @@ valid_actions(n::InitialNode, p::InfoProblem) = [[0;0;;]]
 """
 valid_actions(n::InfoNode, p::InfoProblem) = [[x;y;;] for x in -1:1 if 0<n.X[1]+x≤p.Xlims[1] for y in -1:1 if (0<n.X[2]+y≤p.Xlims[2] && x*y+x+y≠0)]
 
-
 """
     make_successor(node::InitialNode, a::Matrix{Int64}, p::InfoProblem, rng=Random.GLOBAL_RNG)
 

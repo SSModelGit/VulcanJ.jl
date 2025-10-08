@@ -43,10 +43,11 @@ estimator(mdp, s, remaining_depth) = s.env.δmi
 
 function run_mcts()
     let p = setup()
-        solver = DPWSolver(n_iterations=1000,depth=2, estimate_value=estimator)
+        solver = DPWSolver(n_iterations=1000,depth=5, estimate_value=estimator)
         policy = solve(solver, p)
         action(policy, p.Xinit)
         println("Tree")
-        @show tree = policy.tree
+        # @show tree = policy.tree
+        policy.tree
     end
 end
