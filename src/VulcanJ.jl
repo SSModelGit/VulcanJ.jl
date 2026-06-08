@@ -30,6 +30,19 @@ using LinearAlgebra: normalize, ⋅, norm
 using Distributions: Normal, MvNormal
 
 using POMDPs, POMDPTools
+
+# Register required functions with POMDPTools if available (best-effort).
+# This intentionally does not provide fallbacks —
+# missing functions should raise clear errors so implementers know what to provide.
+try
+  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_initial_gp)
+  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_failure_prob)
+  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :collision_probability)
+  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :add_obs_to_gp)
+  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :posterior_phenomenon_prob)
+catch
+  # If POMDPTools doesn't expose `add_requirement`, silently continue.
+end
 using MuKumari
 ###
 ###############################################
@@ -38,7 +51,7 @@ using MuKumari
 # Solver Definition
 # ============================================================================
 
-struct RiskBoundedInfoMCTS <: Solver
+@with_kw struct RiskBoundedInfoMCTS <: Solver
   # Planning parameters
   lookahead::Int              # planning horizon H per solve call
   time_budget::Float64        # planning time limit τ (seconds)
@@ -58,7 +71,7 @@ end
 # Policy Definition (stores computed tree and values)
 # ============================================================================
 
-struct RiskBoundedInfoPolicy <: Policy
+@with_kw struct RiskBoundedInfoPolicy <: Policy
   solver::RiskBoundedInfoMCTS
   mdp::MDP
   mdp_state_type::DataType     # cache state type for tree keys
@@ -72,6 +85,17 @@ struct RiskBoundedInfoPolicy <: Policy
   risk_used::Float64           # cumulative risk consumed so far
   info_gained::Float64         # cumulative information reward
   time_step::Int               # current mission step
+end
+
+# ============================================================================
+# Helper struct for tree nodes
+# ============================================================================
+
+@with_kw struct TreeNode
+  visits::Int
+  action_values::Dict  # action → estimated value
+  action_counts::Dict  # action → visit count
+  actions_tried::Set   # actions that have been sampled
 end
 
 
@@ -356,16 +380,8 @@ end
 
 
 # ============================================================================
-# Helper structures and functions
+# Helper functions
 # ============================================================================
-
-struct TreeNode
-  visits::Int
-  action_values::Dict  # action → estimated value
-  action_counts::Dict  # action → visit count
-  actions_tried::Set   # actions that have been sampled
-end
-
 
 function compute_performance_guided_bound(
   risk_per_step::Real,
@@ -396,64 +412,37 @@ end
 function condition_gp(gp::Any, observation::Real)
   # Return new GP posterior conditioned on observation
   # Minimal version: add observation point to GP
-  
-  # Prefer the project-local GP update helper when available.
-  if isdefined(@__MODULE__, :add_obs_to_gp)
-    x = last_observation_location(gp)
-    return add_obs_to_gp(x, observation, gp)
-  elseif isdefined(@__MODULE__, :update_observations)
-    x = last_observation_location(gp)
-    return update_observations(gp, x, observation)
-  else
-    x = last_observation_location(gp)
-    return append_observation_to_gp(gp, x, observation)
-  end
+
+  # Expect a project-provided GP updater `add_obs_to_gp(x, y, gp)` to exist.
+  x = last_observation_location(gp)
+  return add_obs_to_gp(x, observation, gp)
 end
 
 
 function compute_kl_reward(gp_prior::Any, gp_posterior::Any, mdp::Any)
   # Sum KL divergences between posteriors for each phenomenon variable
   # ∑_i D_KL( p(X_i | posterior) || p(X_i | prior) )
-  
-  if isdefined(@__MODULE__, :phenomenon_indices) && isdefined(@__MODULE__, :posterior_phenomenon_prob)
-    kl_sum = 0.0
-    for i in phenomenon_indices(mdp)
-      p_prior = posterior_phenomenon_prob(gp_prior, i)
-      p_post = posterior_phenomenon_prob(gp_posterior, i)
-      kl_sum += kl_divergence(p_post, p_prior)
-    end
-    return kl_sum
+  kl_sum = 0.0
+  for i in phenomenon_indices(mdp)
+    p_prior = posterior_phenomenon_prob(gp_prior, i)
+    p_post = posterior_phenomenon_prob(gp_posterior, i)
+    kl_sum += kl_divergence(p_post, p_prior)
   end
-
-  # Fallback: compare predictive Gaussians at the stored support points.
-  return gp_predictive_kl(gp_prior, gp_posterior)
+  return kl_sum
 end
 
 
 function collision_probability(mdp::Any, state::Any, action::Any)
   # Return P[C_{k+1} | state, action]
-  # Placeholder: extract from MDP
-
-  if hasmethod(get_failure_prob, Tuple{typeof(mdp), Any, Any})
-    return get_failure_prob(mdp, state, action)
-  elseif hasmethod(get_failure_prob, Tuple{typeof(mdp), Any})
-    return get_failure_prob(mdp, (state, action))
-  else
-    return 0.0
-  end
+  # Expect the MDP to implement `get_failure_prob(mdp, state, action)`.
+  return get_failure_prob(mdp, state, action)
 end
 
 
 function initialize_gp_belief(mdp::Any, state::Any)
   # Initialize and return a GP belief for the environment
-  # Prefer an explicit model field; otherwise fall back to a domain helper.
-  if hasproperty(mdp, :gp0)
-    return getproperty(mdp, :gp0)
-  elseif hasmethod(get_initial_gp, Tuple{typeof(mdp)})
-    return get_initial_gp(mdp)
-  else
-    return initial_gp_from_state(mdp, state)
-  end
+  # Expect the MDP to implement `get_initial_gp(mdp, state)`.
+  return get_initial_gp(mdp, state)
 end
 
 
@@ -491,17 +480,9 @@ end
 
 
 function predictive_moments(gp::Any)
-  if hasmethod(predict_gp, Tuple{typeof(gp), AbstractMatrix})
-    X = last_observation_location(gp)
-    μ, Σ = predict_gp(gp, X)
-    return first(vec(μ)), first(vec(Σ))
-  elseif hasmethod(predict_f, Tuple{typeof(gp), AbstractMatrix})
-    X = last_observation_location(gp)
-    μ, Σ = predict_f(gp, X)
-    return first(vec(μ)), first(vec(Σ))
-  else
-    return 0.0, 1.0
-  end
+  X = last_observation_location(gp)
+  μ, Σ = predict_f(gp, X)
+  return first(vec(μ)), first(vec(Σ))
 end
 
 
@@ -518,40 +499,17 @@ extract_location(state::Any) = state isa AbstractArray ? reshape(Float64.(state)
 
 
 function get_failure_prob(mdp::Any, state::Any, action::Any)
-  if hasproperty(mdp, :failure_probability)
-    fp = getproperty(mdp, :failure_probability)
-    if fp isa Function
-      return Float64(fp(state, action))
-    end
-  end
-  return 0.0
+  error("get_failure_prob(mdp, state, action) must be implemented for your MDP type")
 end
 
 
-function get_initial_gp(mdp::Any)
-  if hasproperty(mdp, :gp0)
-    return getproperty(mdp, :gp0)
-  end
-  return GPE(Matrix{Float64}(undef, 1, 0), Float64[], MeanZero(), SE(zeros(1), 0.0))
+function get_initial_gp(mdp::Any, state::Any)
+  error("get_initial_gp(mdp, state) must be implemented for your MDP type")
 end
 
 
 function append_observation_to_gp(gp::Any, x::AbstractMatrix, y::Real)
-  if hasproperty(gp, :x) && hasproperty(gp, :y) && hasproperty(gp, :mean) && hasproperty(gp, :kernel)
-    Xold = getproperty(gp, :x)
-    yold = getproperty(gp, :y)
-    Xnew = hcat(Xold, x)
-    ynew = vcat(yold, Float64(y))
-    return GPE(Xnew, ynew, getproperty(gp, :mean), getproperty(gp, :kernel))
-  elseif hasproperty(gp, :x) && hasproperty(gp, :y)
-    Xold = getproperty(gp, :x)
-    yold = getproperty(gp, :y)
-    Xnew = hcat(Xold, x)
-    ynew = vcat(yold, Float64(y))
-    return GPE(Xnew, ynew, MeanZero(), SE(zeros(size(Xnew, 1)), 0.0))
-  else
-    return gp
-  end
+  error("append_observation_to_gp is deprecated; implement add_obs_to_gp(x,y,gp) in your project and call that instead")
 end
 
 
