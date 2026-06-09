@@ -31,6 +31,7 @@ VOLCANO_ENV = Dict{Symbol, Any}(
     :base_risk => 0.02,
     :peak_risk => 0.60,
     :risk_scale => 1.25,
+    :safe_elevation => 7.5,
     :elevation_threshold => 7.5,
     :prior_sites => [
         [1.5 1.5],
@@ -137,7 +138,7 @@ POMDPs.isterminal(mdp::VolcanoSearchMDP, s::Matrix) = false
 ### ==================================================================
 
 # Generate initial Gaussian depending on the prior we have
-function get_initial_gp(mdp::VolcanoSearchMDP, ::Matrix)
+function VulcanJ.get_initial_gp(mdp::VolcanoSearchMDP, ::Matrix)
     prior_sites = mdp.env[:prior_sites]
     # build X0 as 2×N matrix for GP inputs
     X0 = hcat([site' for site in prior_sites]...)
@@ -146,7 +147,7 @@ function get_initial_gp(mdp::VolcanoSearchMDP, ::Matrix)
 end
 
 # How do we add observations?
-function add_obs_to_gp(X::Matrix, y::Float64, gp::GPE)
+function VulcanJ.add_obs_to_gp(X::Matrix, y::Float64, gp::GPE)
     y_new = vcat(gp.y, y)
     x_new = hcat(gp.x, X)
     return GPE(x_new, y_new, gp.mean, gp.kernel)
@@ -162,10 +163,11 @@ function boundary_violation(sp, env)
 end
 
 # 
-function get_failure_prob(mdp::VolcanoSearchMDP, s::Matrix, a::Symbol)
+function VulcanJ.get_failure_prob(mdp::VolcanoSearchMDP, s::Matrix, a::Symbol)
     let sp = volcano_step(mdp, s, a), elev = mdp.elevation_fn(sp),
-        safe_elevation = float(mdp.env[:safe_elevation]), risk_scale = float(mdp.env[:risk_scale]),
-        base_risk = float(mdp.env[:base_risk]), peak_risk = float(mdp.env[:peak_risk])
+        safe_elevation = get(mdp.env, :safe_elevation, mdp.env[:elevation_threshold]),
+        risk_scale = mdp.env[:risk_scale],
+        base_risk = mdp.env[:base_risk], peak_risk = mdp.env[:peak_risk]
 
         boundary_penalty = boundary_violation(sp, mdp.env) ? 0.10 : 0.0
         elevation_risk = 1 / (1 + exp(-(elev - safe_elevation) / risk_scale))
@@ -174,7 +176,7 @@ function get_failure_prob(mdp::VolcanoSearchMDP, s::Matrix, a::Symbol)
 end
 
 # Compute the likelihood of the phenomenon of interest at a given site existing based on the current GP
-function posterior_phenomenon_prob(gp::GPE, idx::Int)
+function VulcanJ.posterior_phenomenon_prob(gp::GPE, idx::Int)
     site = VOLCANO_ENV[:phenomenon_sites][idx]
     μ, Σ = predict_f(gp, Matrix(site'))
     μv = first(vec(μ))
@@ -184,8 +186,8 @@ function posterior_phenomenon_prob(gp::GPE, idx::Int)
 end
 
 # Housekeeping items
-horizon(mdp::VolcanoSearchMDP) = mdp.env[:horizon_steps] # MCTS horizon
-phenomenon_indices(mdp::VolcanoSearchMDP) = eachindex(mdp.env[:phenomenon_sites]) # what?
+VulcanJ.horizon(mdp::VolcanoSearchMDP) = mdp.env[:horizon_steps] # MCTS horizon
+VulcanJ.phenomenon_indices(mdp::VolcanoSearchMDP) = eachindex(mdp.env[:phenomenon_sites]) # what?
 
 function volcano_search_solver(; rng = MersenneTwister(7))
     mdp = VolcanoSearchMDP()

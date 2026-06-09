@@ -34,12 +34,14 @@ using POMDPs, POMDPTools
 # Register required functions with POMDPTools if available (best-effort).
 # This intentionally does not provide fallbacks —
 # missing functions should raise clear errors so implementers know what to provide.
-POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_initial_gp)
-POMDPTools.add_requirement(RiskBoundedInfoMCTS, :add_obs_to_gp)
-POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_failure_prob)
-POMDPTools.add_requirement(RiskBoundedInfoMCTS, :posterior_phenomenon_prob)
-POMDPTools.add_requirement(RiskBoundedInfoMCTS, :phenomenon_indices)
-POMDPTools.add_requirement(RiskBoundedInfoMCTS, :horizon)
+# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_initial_gp)
+# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :add_obs_to_gp)
+# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_failure_prob)
+# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :posterior_phenomenon_prob)
+# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :phenomenon_indices)
+# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :horizon)
+
+export get_initial_gp, add_obs_to_gp, get_failure_prob, posterior_phenomenon_prob, phenomenon_indices, horizon
 
 using MuKumari
 ###
@@ -125,7 +127,7 @@ end
 
 function POMDPs.action(policy::RiskBoundedInfoPolicy, s::Any)
   # On first visit to this state: build search tree
-  if s ∉ policy.tree_nodes
+  if s ∉ keys(policy.tree_nodes)
     build_search_tree(policy, s)
   end
 
@@ -162,7 +164,7 @@ function build_search_tree(policy::RiskBoundedInfoPolicy, initial_state::Any)
   )
   
   # Retrieve or initialize GP belief at initial state
-  if initial_state ∉ policy.node_gps
+  if initial_state ∉ keys(policy.node_gps)
     policy.node_gps[initial_state] = initialize_gp_belief(mdp, initial_state)
   end
   
@@ -189,7 +191,12 @@ function build_search_tree(policy::RiskBoundedInfoPolicy, initial_state::Any)
   
   # Extract best action from root
   root_node = policy.tree_nodes[initial_state]
-  best_a = argmax(root_node.action_values)
+  if isempty(root_node.action_values)
+    feasible = actions(mdp, initial_state)
+    best_a = isempty(feasible) ? nothing : first(feasible)
+  else
+    best_a = argmax(root_node.action_values)
+  end
   policy.best_action[initial_state] = best_a
 end
 
@@ -217,7 +224,7 @@ function sample_rollout(
   end
   
   # Get or initialize node metadata
-  if state ∉ policy.tree_nodes
+  if state ∉ keys(policy.tree_nodes)
     policy.tree_nodes[state] = TreeNode(
       visits = 0,
       action_values = Dict(),
@@ -234,6 +241,10 @@ function sample_rollout(
   
   if isnothing(action)  # No feasible action
     return nothing  # Branch is infeasible
+  end
+
+  if !haskey(node.action_values, action)
+    node.action_values[action] = 0.0
   end
   
   # OBSERVATION ESTIMATION VIA GAUSS-HERMITE QUADRATURE
@@ -298,10 +309,6 @@ function sample_rollout(
   # BACKPROPAGATION
   if result !== nothing
     node.visits += 1
-
-    if action ∉ keys(node.action_values)
-      node.action_values[action] = 0.0
-    end
 
     # Running average of action returns
     old_val = node.action_values[action]
@@ -498,6 +505,34 @@ function kl_divergence(p_post::Real, p_prior::Real)
   q = clamp(float(p_prior), eps(), 1 - eps())
   p = clamp(float(p_post), eps(), 1 - eps())
   return p * log(p / q) + (1 - p) * log((1 - p) / (1 - q))
+end
+
+###
+# Generics
+###
+
+function get_failure_prob(mdp::Any, s::Any, a::Any)
+  error("MDP must implement `get_failure_prob(mdp, s, a)` to return risk for state-action pair.")
+end
+
+function get_initial_gp(mdp::Any, s::Any)
+  error("MDP must implement `get_initial_gp(mdp, s)` to return initial GP belief.")
+end
+
+function posterior_phenomenon_prob(gp::Any, idx::Int)
+  error("MDP must implement `posterior_phenomenon_prob(gp, idx)` to return probability of phenomenon at index.")
+end
+
+function phenomenon_indices(mdp::Any)
+  error("MDP must implement `phenomenon_indices(mdp)` to return indices of phenomenon variables.")
+end
+
+function horizon(mdp::Any)
+  error("MDP must implement `horizon(mdp)` to return episode length.")
+end
+
+function add_obs_to_gp(X::Any, y::Any, gp::Any)
+  error("MDP must implement `add_obs_to_gp(X, y, gp)` to return updated GP with new observation.")
 end
 
 end
