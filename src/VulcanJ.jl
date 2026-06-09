@@ -34,15 +34,13 @@ using POMDPs, POMDPTools
 # Register required functions with POMDPTools if available (best-effort).
 # This intentionally does not provide fallbacks —
 # missing functions should raise clear errors so implementers know what to provide.
-try
-  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_initial_gp)
-  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_failure_prob)
-  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :collision_probability)
-  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :add_obs_to_gp)
-  POMDPTools.add_requirement(RiskBoundedInfoMCTS, :posterior_phenomenon_prob)
-catch
-  # If POMDPTools doesn't expose `add_requirement`, silently continue.
-end
+POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_initial_gp)
+POMDPTools.add_requirement(RiskBoundedInfoMCTS, :add_obs_to_gp)
+POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_failure_prob)
+POMDPTools.add_requirement(RiskBoundedInfoMCTS, :posterior_phenomenon_prob)
+POMDPTools.add_requirement(RiskBoundedInfoMCTS, :phenomenon_indices)
+POMDPTools.add_requirement(RiskBoundedInfoMCTS, :horizon)
+
 using MuKumari
 ###
 ###############################################
@@ -74,7 +72,7 @@ end
 @with_kw struct RiskBoundedInfoPolicy <: Policy
   solver::RiskBoundedInfoMCTS
   mdp::MDP
-  mdp_state_type::DataType     # cache state type for tree keys
+  mdp_state_type::Any     # cache state type for tree keys
   
   # Tree bookkeeping
   tree_nodes::Dict             # state → node_metadata
@@ -492,26 +490,9 @@ function initial_gp_from_state(mdp::Any, state::Any)
 end
 
 
-observation_dim(mdp::Any, state::Any) = isdefined(@__MODULE__, :extract_location) ? size(extract_location(state), 1) : 1
+observation_dim(mdp::Any, state::Any) = size(extract_location(state), 2)
 
-
-extract_location(state::Any) = state isa AbstractArray ? reshape(Float64.(state), :, 1) : reshape([Float64(state)], :, 1)
-
-
-function get_failure_prob(mdp::Any, state::Any, action::Any)
-  error("get_failure_prob(mdp, state, action) must be implemented for your MDP type")
-end
-
-
-function get_initial_gp(mdp::Any, state::Any)
-  error("get_initial_gp(mdp, state) must be implemented for your MDP type")
-end
-
-
-function append_observation_to_gp(gp::Any, x::AbstractMatrix, y::Real)
-  error("append_observation_to_gp is deprecated; implement add_obs_to_gp(x,y,gp) in your project and call that instead")
-end
-
+extract_location(state::Any) = state isa AbstractArray ? reshape(Float64.(state), 1, :) : reshape([Float64(state)], 1, :)
 
 function kl_divergence(p_post::Real, p_prior::Real)
   q = clamp(float(p_prior), eps(), 1 - eps())
