@@ -29,9 +29,14 @@ VOLCANO_ENV = Dict{Symbol, Any}(
     :caldera_width => 0.75,
     :caldera_bonus => 7.0,
     :base_risk => 0.02,
-    :peak_risk => 0.60,
-    :risk_scale => 1.25,
-    :safe_elevation => 7.5,
+    :obstacle_risk_peak => 0.20,
+    :obstacle_risk_radius => 2.25,
+    :obstacle_risk_sigma => 0.85,
+    :obstacle_points => [
+        [3.0 3.0],
+        [7.0 6.0],
+        [6.5 2.5],
+    ],
     :elevation_threshold => 7.5,
     :prior_sites => [
         [1.5 1.5],
@@ -39,18 +44,7 @@ VOLCANO_ENV = Dict{Symbol, Any}(
         [5.0 5.0],
         [8.5 1.5],
         [8.5 8.5],
-    ],
-    :phenomenon_sites => [
-        [2.0 2.0],
-        [2.0 5.0],
-        [2.0 8.0],
-        [5.0 2.0],
-        [5.0 5.0],
-        [5.0 8.0],
-        [8.0 2.0],
-        [8.0 5.0],
-        [8.0 8.0],
-    ],
+    ]
 )
 
 function make_volcanic_elevation(env::Dict{Symbol, Any})
@@ -149,7 +143,7 @@ end
 # How do we add observations?
 function VulcanJ.add_obs_to_gp(X::Matrix, y::Float64, gp::GPE)
     y_new = vcat(gp.y, y)
-    x_new = hcat(gp.x, X)
+    x_new = hcat(gp.x, X')
     return GPE(x_new, y_new, gp.mean, gp.kernel)
 end
 
@@ -162,41 +156,61 @@ function boundary_violation(sp, env)
     end
 end
 
+function obstacle_risk_at(s, obstacles, peak_risk, radius, sigma)
+    x = float(s[1])
+    y = float(s[2])
+    total = 0.0
+    for obs in obstacles
+        ox = float(obs[1])
+        oy = float(obs[2])
+        d = hypot(x - ox, y - oy)
+        if d ≤ radius
+            total += peak_risk * exp(-(d^2) / (2 * sigma^2))
+        end
+    end
+    return total
+end
+
 # 
 function VulcanJ.get_failure_prob(mdp::VolcanoSearchMDP, s::Matrix, a::Symbol)
-    let sp = volcano_step(mdp, s, a), elev = mdp.elevation_fn(sp),
-        safe_elevation = get(mdp.env, :safe_elevation, mdp.env[:elevation_threshold]),
-        risk_scale = mdp.env[:risk_scale],
-        base_risk = mdp.env[:base_risk], peak_risk = mdp.env[:peak_risk]
+    let sp = volcano_step(mdp, s, a),
+        base_risk = mdp.env[:base_risk],
+        obstacle_peak = mdp.env[:obstacle_risk_peak],
+        obstacle_radius = mdp.env[:obstacle_risk_radius],
+        obstacle_sigma = mdp.env[:obstacle_risk_sigma],
+        obstacles = mdp.env[:obstacle_points]
 
         boundary_penalty = boundary_violation(sp, mdp.env) ? 0.10 : 0.0
-        elevation_risk = 1 / (1 + exp(-(elev - safe_elevation) / risk_scale))
-        return clamp(base_risk + peak_risk * elevation_risk + boundary_penalty, 0.0, 0.95)
+        obstacle_risk = obstacle_risk_at(sp, obstacles, obstacle_peak, obstacle_radius, obstacle_sigma)
+        return clamp(base_risk + obstacle_risk + boundary_penalty, 0.0, 0.95)
     end
 end
 
 # Compute the likelihood of the phenomenon of interest at a given site existing based on the current GP
-function VulcanJ.posterior_phenomenon_prob(gp::GPE, idx::Int)
-    site = VOLCANO_ENV[:phenomenon_sites][idx]
-    μ, Σ = predict_f(gp, Matrix(site'))
+function VulcanJ.posterior_phenomenon_prob(mdp::VolcanoSearchMDP, gp::GPE, s::Matrix)
+    μ, Σ = predict_f(gp, s')
     μv = first(vec(μ))
     σ² = max(first(vec(Σ)), eps())
-    threshold = VOLCANO_ENV[:elevation_threshold]
+    threshold = mdp.env[:elevation_threshold]
     return 0.5 * (1 - erf((threshold - μv) / sqrt(2 * σ²)))
 end
 
 # Housekeeping items
 VulcanJ.horizon(mdp::VolcanoSearchMDP) = mdp.env[:horizon_steps] # MCTS horizon
-VulcanJ.phenomenon_indices(mdp::VolcanoSearchMDP) = eachindex(mdp.env[:phenomenon_sites]) # what?
+
+function VulcanJ.cellsites(mdp::VolcanoSearchMDP)
+    nx, ny = mdp.env[:field_size]
+    return [reshape([float(x), float(y)], 1, 2) for x in 1:nx for y in 1:ny]
+end
 
 function volcano_search_solver(; rng = MersenneTwister(7))
     mdp = VolcanoSearchMDP()
     solver = RiskBoundedInfoMCTS(
         lookahead = 6,
-        time_budget = 0.25,
+        time_budget = 25,
         quad_order = 5,
-        risk_budget = 0.45,
-        alpha = 0.55,
+        risk_budget = 5.0,
+        alpha = 0.0,
         reference_reward = 1.0,
         rng = rng,
     )
@@ -211,7 +225,4 @@ function run_volcano_search_demo(; rng = MersenneTwister(7))
     return (mdp = mdp, policy = policy, state = s0, action = a0)
 end
 
-if abspath(PROGRAM_FILE) == @__FILE__
-    result = run_volcano_search_demo()
-    println("Selected action: ", result.action)
-end
+result = run_volcano_search_demo();

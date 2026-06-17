@@ -38,10 +38,9 @@ using POMDPs, POMDPTools
 # POMDPTools.add_requirement(RiskBoundedInfoMCTS, :add_obs_to_gp)
 # POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_failure_prob)
 # POMDPTools.add_requirement(RiskBoundedInfoMCTS, :posterior_phenomenon_prob)
-# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :phenomenon_indices)
 # POMDPTools.add_requirement(RiskBoundedInfoMCTS, :horizon)
 
-export get_initial_gp, add_obs_to_gp, get_failure_prob, posterior_phenomenon_prob, phenomenon_indices, horizon
+export get_initial_gp, add_obs_to_gp, get_failure_prob, posterior_phenomenon_prob, cellsites, horizon
 
 using MuKumari
 ###
@@ -97,6 +96,9 @@ end
   action_counts::Dict  # action → visit count
   actions_tried::Set   # actions that have been sampled
 end
+
+Base.copy(node::TreeNode) = TreeNode(node.visits, copy(node.action_values), copy(node.action_counts), copy(node.actions_tried))
+increment_node_visit_count(node::TreeNode) = TreeNode(node.visits + 1, copy(node.action_values), copy(node.action_counts), copy(node.actions_tried))
 
 
 # ============================================================================
@@ -154,6 +156,7 @@ function build_search_tree(policy::RiskBoundedInfoPolicy, initial_state::Any)
     solver.reference_reward,
     solver.alpha
   )
+  println("this is our initial delta allowed for this step: $delta_allowed")
   
   # Initialize root node
   policy.tree_nodes[initial_state] = TreeNode(
@@ -180,7 +183,7 @@ function build_search_tree(policy::RiskBoundedInfoPolicy, initial_state::Any)
       initial_state,
       initial_gp,
       policy.time_step,
-      policy.time_step + solver.lookahead,
+      solver.lookahead,
       policy.risk_used,
       0.0,
       delta_allowed
@@ -240,6 +243,7 @@ function sample_rollout(
   action = select_action(policy, state, node, risk_accum, risk_allowed)
   
   if isnothing(action)  # No feasible action
+    println("infeasible at depth $depth with accumulated risk $risk_accum; pruning branch.")
     return nothing  # Branch is infeasible
   end
 
@@ -290,6 +294,7 @@ function sample_rollout(
   
   if risk_next > risk_allowed
     # Prune this action and fail
+    println("pruning action $action at depth $depth due to risk $risk_next exceeding allowed $risk_allowed")
     delete!(node.actions_tried, action)
     return nothing
   end
@@ -308,7 +313,7 @@ function sample_rollout(
   
   # BACKPROPAGATION
   if result !== nothing
-    node.visits += 1
+    increment_node_visit_count(node)
 
     # Running average of action returns
     old_val = node.action_values[action]
@@ -319,6 +324,7 @@ function sample_rollout(
     return result
   else
     # Action failed; try next action in select_action loop
+    println("we might need a better way to deal with terminal failure")
     return nothing
   end
 end
@@ -406,11 +412,10 @@ end
 function gp_predict(gp::Any, state::Any)
   # Extract location from state; predict mean and variance
   # Returns (μ::Float, σ²::Float)
-  
-  # Placeholder: assumes your GP has predict_f or similar
   location = extract_location(state)
-  (mu, sigma2) = predict_f(gp, location)
-  return (mu, sigma2)
+  (mu, sigma2) = predict_f(gp, location')
+  # since predicting over only one state we know dimensionality of vec to be 1x1 per each
+  return (mu[1], sigma2[1])
 end
 
 
@@ -428,9 +433,9 @@ function compute_kl_reward(gp_prior::Any, gp_posterior::Any, mdp::Any)
   # Sum KL divergences between posteriors for each phenomenon variable
   # ∑_i D_KL( p(X_i | posterior) || p(X_i | prior) )
   kl_sum = 0.0
-  for i in phenomenon_indices(mdp)
-    p_prior = posterior_phenomenon_prob(gp_prior, i)
-    p_post = posterior_phenomenon_prob(gp_posterior, i)
+  for s in cellsites(mdp)
+    p_prior = posterior_phenomenon_prob(mdp, gp_prior, s)
+    p_post = posterior_phenomenon_prob(mdp, gp_posterior, s)
     kl_sum += kl_divergence(p_post, p_prior)
   end
   return kl_sum
@@ -463,15 +468,7 @@ function next_state(mdp::Any, state::Any, action::Any, rng::AbstractRNG)
 end
 
 
-function last_observation_location(gp::Any)
-  if hasproperty(gp, :x) && size(getproperty(gp, :x), 2) > 0
-    return getproperty(gp, :x)[:, end:end]
-  elseif hasproperty(gp, :X) && size(getproperty(gp, :X), 2) > 0
-    return getproperty(gp, :X)[:, end:end]
-  else
-    return zeros(1, 1)
-  end
-end
+last_observation_location(gp::Any) = reshape(gp.x[:, end:end], 1, :)
 
 
 function gp_predictive_kl(gp_prior::Any, gp_posterior::Any)
@@ -486,7 +483,7 @@ end
 
 function predictive_moments(gp::Any)
   X = last_observation_location(gp)
-  μ, Σ = predict_f(gp, X)
+  μ, Σ = predict_f(gp, X')
   return first(vec(μ)), first(vec(Σ))
 end
 
@@ -519,12 +516,12 @@ function get_initial_gp(mdp::Any, s::Any)
   error("MDP must implement `get_initial_gp(mdp, s)` to return initial GP belief.")
 end
 
-function posterior_phenomenon_prob(gp::Any, idx::Int)
+function posterior_phenomenon_prob(mdp, gp, s)
   error("MDP must implement `posterior_phenomenon_prob(gp, idx)` to return probability of phenomenon at index.")
 end
 
-function phenomenon_indices(mdp::Any)
-  error("MDP must implement `phenomenon_indices(mdp)` to return indices of phenomenon variables.")
+function cellsites(mdp::Any)
+  error("MDP must implement `cellsites(mdp)` to return discretized cells covering the searchable space.")
 end
 
 function horizon(mdp::Any)
