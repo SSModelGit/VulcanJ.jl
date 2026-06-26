@@ -60,6 +60,7 @@ using MuKumari
   risk_budget::Float64        # total risk budget Δ
   alpha::Float64              # performance-guided scaling: 0 ≤ α ≤ 1
   reference_reward::Float64   # baseline expected reward for scaling
+  risk_dereward::Float64 = -1000000000.0 # penalty for exceeding risk allowance
   
   # RNG
   rng::AbstractRNG
@@ -90,7 +91,7 @@ end
 # Helper struct for tree nodes
 # ============================================================================
 
-@with_kw struct TreeNode
+@with_kw mutable struct TreeNode
   visits::Int
   action_values::Dict  # action → estimated value
   action_counts::Dict  # action → visit count
@@ -98,8 +99,6 @@ end
 end
 
 Base.copy(node::TreeNode) = TreeNode(node.visits, copy(node.action_values), copy(node.action_counts), copy(node.actions_tried))
-increment_node_visit_count(node::TreeNode) = TreeNode(node.visits + 1, copy(node.action_values), copy(node.action_counts), copy(node.actions_tried))
-
 
 # ============================================================================
 # Main solve() function
@@ -185,7 +184,6 @@ function build_search_tree(policy::RiskBoundedInfoPolicy, initial_state::Any)
       policy.time_step,
       solver.lookahead,
       policy.risk_used,
-      0.0,
       delta_allowed
     )
 
@@ -215,15 +213,34 @@ function sample_rollout(
   depth::Int,
   horizon_end::Int,
   risk_accum::Real,
-  info_accum::Real,
   risk_allowed::Real
 )
   mdp = policy.mdp
   solver = policy.solver
+
+  ### OBSERVATION ESTIMATION VIA GAUSS-HERMITE QUADRATURE
+  (μ, σ²) = gp_predict(gp, state)  # GP mean and variance at current state
+
+  abscissae, weights = gausshermite(solver.quad_order)
+
+  expected_info_delta = 0.0
+  for j in eachindex(abscissae)
+    # synthetic observation
+    y_j = sqrt(2 * σ²) * abscissae[j] + μ
+
+    # Condition on this observation
+    gp_tmp = add_obs_to_gp(state, y_j, gp)
+
+    # Compute KL divergence (reward for this measurement)
+    kl_j = compute_kl_reward(gp, gp_tmp, mdp)
+
+    # Accumulate weighted (Fast Gauss-Hermite formula uses sqrt(pi))
+    expected_info_delta += (weights[j] / sqrt(π)) * kl_j
+  end
   
   # Terminal condition: reached planning horizon
   if depth == horizon_end
-    return info_accum  # return cumulative info as leaf value
+    return expected_info_delta  # return cumulative info as leaf value
   end
   
   # Get or initialize node metadata
@@ -243,45 +260,20 @@ function sample_rollout(
   action = select_action(policy, state, node, risk_accum, risk_allowed)
   
   if isnothing(action)  # No feasible action
-    println("infeasible at depth $depth with accumulated risk $risk_accum; pruning branch.")
-    return nothing  # Branch is infeasible
+    println("infeasible at depth $depth with accumulated risk $risk_accum; returning extreme negative reward.")
+    return solver.risk_dereward  # Branch is infeasible
   end
 
   if !haskey(node.action_values, action)
     node.action_values[action] = 0.0
   end
-  
-  # OBSERVATION ESTIMATION VIA GAUSS-HERMITE QUADRATURE
-  # Predict next measurement under current GP
-  (μ, σ²) = gp_predict(gp, state)  # mean and variance
-  
-  abscissae, weights = gausshermite(solver.quad_order)
-  
-  # Expected information gain: average over quadrature branches
-  expected_info_delta = 0.0
-  
-  for j in eachindex(abscissae)
-    # Generate synthetic observation from Gaussian
-    y_j = sqrt(2 * σ²) * abscissae[j] + μ
-
-    # Condition GP on this observation (virtual update)
-    gp_tmp = condition_gp(gp, y_j)
-
-    # Compute KL divergence (reward for this measurement)
-    kl_j = compute_kl_reward(gp, gp_tmp, mdp)
-
-    # Accumulate weighted (Fast Gauss-Hermite formula uses sqrt(pi))
-    expected_info_delta += (weights[j] / sqrt(π)) * kl_j
-  end
-
-  info_next = info_accum + expected_info_delta
 
   # Select one quadrature branch to use for the recursive GP update
   wsum = sum(weights)
   probs = (weights ./ (wsum > 0 ? wsum : 1.0))
   idx = sample(Weights(probs))
   y_selected = sqrt(2 * σ²) * abscissae[idx] + μ
-  gp_for_recursion = condition_gp(gp, y_selected)
+  gp_for_recursion = add_obs_to_gp(state, y_selected, gp)
   
   # TRANSITION & RISK CHECK
   # Sample next state (conditioned on no collision)
@@ -292,12 +284,12 @@ function sample_rollout(
   
   risk_next = risk_accum + delta_k
   
-  if risk_next > risk_allowed
-    # Prune this action and fail
-    println("pruning action $action at depth $depth due to risk $risk_next exceeding allowed $risk_allowed")
-    delete!(node.actions_tried, action)
-    return nothing
-  end
+  # if risk_next > risk_allowed
+  #   # Prune this action and fail
+  #   println("pruning action $action at depth $depth due to risk $risk_next exceeding allowed $risk_allowed")
+  #   delete!(node.actions_tried, action)
+  #   return solver.risk_dereward
+  # end
   
   # RECURSE
   result = sample_rollout(
@@ -307,26 +299,36 @@ function sample_rollout(
     depth + 1,
     horizon_end,
     risk_next,
-    info_next,
     risk_allowed
   )
   
   # BACKPROPAGATION
-  if result !== nothing
-    increment_node_visit_count(node)
 
-    # Running average of action returns
-    old_val = node.action_values[action]
-    count = get(node.action_counts, action, 0) + 1
-    node.action_values[action] = (old_val * (count - 1) + result) / count
-    node.action_counts[action] = count
+  node.visits += 1
 
-    return result
-  else
-    # Action failed; try next action in select_action loop
-    println("we might need a better way to deal with terminal failure")
-    return nothing
-  end
+  # Running average of action returns
+  old_val = node.action_values[action]
+  count = get(node.action_counts, action, 0) + 1
+  node.action_values[action] = (old_val * (count - 1) + result) / count
+  node.action_counts[action] = count
+
+  return result
+
+  # if result !== nothing
+  #   node.visits += 1
+
+  #   # Running average of action returns
+  #   old_val = node.action_values[action]
+  #   count = get(node.action_counts, action, 0) + 1
+  #   node.action_values[action] = (old_val * (count - 1) + result) / count
+  #   node.action_counts[action] = count
+
+  #   return result
+  # else
+  #   # Action failed; try next action in select_action loop
+  #   println("we might need a better way to deal with terminal failure")
+  #   return nothing
+  # end
 end
 
 
@@ -416,16 +418,6 @@ function gp_predict(gp::Any, state::Any)
   (mu, sigma2) = predict_f(gp, location')
   # since predicting over only one state we know dimensionality of vec to be 1x1 per each
   return (mu[1], sigma2[1])
-end
-
-
-function condition_gp(gp::Any, observation::Real)
-  # Return new GP posterior conditioned on observation
-  # Minimal version: add observation point to GP
-
-  # Expect a project-provided GP updater `add_obs_to_gp(x, y, gp)` to exist.
-  x = last_observation_location(gp)
-  return add_obs_to_gp(x, observation, gp)
 end
 
 
