@@ -1,0 +1,5 @@
+# JuliaFormatter configuration
+margin = 108
+indent = 4
+always_for_in = true
+whitespace_typedefs = true

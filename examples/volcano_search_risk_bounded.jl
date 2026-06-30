@@ -17,11 +17,7 @@ VOLCANO_ENV = Dict{Symbol, Any}(
     :discount_factor => 0.97,
     :step_size => 1.0,
     :start_state => [2.0 2.0],
-    :peak_centers => [
-        [5.0 5.0],
-        [7.5 3.0],
-        [3.0 7.5]
-    ],
+    :peak_centers => [[5.0 5.0], [7.5 3.0], [3.0 7.5]],
     :peak_heights => [10.0, 4.0, 3.5],
     :peak_spread => 0.16,
     :caldera_center => [5.0 5.0],
@@ -32,19 +28,9 @@ VOLCANO_ENV = Dict{Symbol, Any}(
     :obstacle_risk_peak => 0.20,
     :obstacle_risk_radius => 2.25,
     :obstacle_risk_sigma => 0.85,
-    :obstacle_points => [
-        [3.0 3.0],
-        [7.0 6.0],
-        [6.5 2.5],
-    ],
+    :obstacle_points => [[3.0 3.0], [7.0 6.0], [6.5 2.5]],
     :elevation_threshold => 7.5,
-    :prior_sites => [
-        [1.5 1.5],
-        [1.5 8.5],
-        [5.0 5.0],
-        [8.5 1.5],
-        [8.5 8.5],
-    ]
+    :prior_sites => [[1.5 1.5], [1.5 8.5], [5.0 5.0], [8.5 1.5], [8.5 8.5]],
 )
 
 function make_volcanic_elevation(env::Dict{Symbol, Any})
@@ -173,17 +159,18 @@ end
 
 # 
 function VulcanJ.get_failure_prob(mdp::VolcanoSearchMDP, s::Matrix, a::Symbol)
-    let sp = volcano_step(mdp, s, a),
-        base_risk = mdp.env[:base_risk],
-        obstacle_peak = mdp.env[:obstacle_risk_peak],
-        obstacle_radius = mdp.env[:obstacle_risk_radius],
-        obstacle_sigma = mdp.env[:obstacle_risk_sigma],
-        obstacles = mdp.env[:obstacle_points]
+    # let sp = volcano_step(mdp, s, a),
+    #     base_risk = mdp.env[:base_risk],
+    #     obstacle_peak = mdp.env[:obstacle_risk_peak],
+    #     obstacle_radius = mdp.env[:obstacle_risk_radius],
+    #     obstacle_sigma = mdp.env[:obstacle_risk_sigma],
+    #     obstacles = mdp.env[:obstacle_points]
 
-        boundary_penalty = boundary_violation(sp, mdp.env) ? 0.10 : 0.0
-        obstacle_risk = obstacle_risk_at(sp, obstacles, obstacle_peak, obstacle_radius, obstacle_sigma)
-        return clamp(base_risk + obstacle_risk + boundary_penalty, 0.0, 0.95)
-    end
+    #     boundary_penalty = boundary_violation(sp, mdp.env) ? 0.10 : 0.0
+    #     obstacle_risk = obstacle_risk_at(sp, obstacles, obstacle_peak, obstacle_radius, obstacle_sigma)
+    #     return clamp(base_risk + obstacle_risk + boundary_penalty, 0.0, 0.95)
+    # end
+    return 0.0  # for now, ignore risk in this example
 end
 
 # Compute the likelihood of the phenomenon of interest at a given site existing based on the current GP
@@ -226,3 +213,38 @@ function run_volcano_search_demo(; rng = MersenneTwister(7))
 end
 
 result = run_volcano_search_demo();
+
+path_states, path_observations = simulate_info_path(
+    result[1],
+    result[2],
+    (m, s) -> m.elevation_fn(s),
+    10;
+    initial_state = copy(result[1].env[:start_state]),
+    update_belief = true,
+)
+
+path_plot = plot_simulated_path(result[1],
+    path_states,
+    path_observations;
+    title = "Volcano Search Path",
+    ground_truth_fn = (m, s) -> m.elevation_fn(s),
+    save_path = "/home/shashank/cbase/secondary/jbase/VulcanJ/examples/res/volcano_search_path.png"
+)
+
+ergodic_gp = get_initial_gp(result[1], copy(result[1].env[:start_state]))
+ergodic_result = one_shot_ergodic_planner(
+    result[1],
+    ergodic_gp,
+    10;
+    initial_state = copy(result[1].env[:start_state]),
+    rng = result[2].solver.rng,
+    observe_fn = (m, s) -> m.elevation_fn(s),
+)
+
+ergodic_path_plot = plot_simulated_path(result[1],
+    ergodic_result.states,
+    ergodic_result.observations;
+    title = "Ergodic Information Path",
+    ground_truth_fn = (m, s) -> m.elevation_fn(s),
+    save_path = "/home/shashank/cbase/secondary/jbase/VulcanJ/examples/res/ergodic_information_path.png"
+)
