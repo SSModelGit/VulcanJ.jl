@@ -11,54 +11,113 @@ using POMDPTools
 
 using VulcanJ
 
+function random_volcanoes(field_size::Tuple{Int, Int}, count::Integer; rng = MersenneTwister(23))
+    nx, ny = field_size
+    volcanoes = Vector{Dict{Symbol, Any}}()
+
+    for _ in 1:count
+        cx = 1.0 + (nx - 1.0) * rand(rng)
+        cy = 1.0 + (ny - 1.0) * rand(rng)
+
+        cone_radius = 45.0 + 55.0 * rand(rng)
+        caldera_radius = 15.0 + 25.0 * rand(rng)
+        caldera_width = 5.0 + 10.0 * rand(rng)
+        ridge_count = rand(rng, 1:3)
+        ridge_centers = Matrix{Float64}[]
+        ridge_heights = Float64[]
+        for _ in 1:ridge_count
+            θ = 2π * rand(rng)
+            r = caldera_radius + cone_radius * (0.25 + 0.65 * rand(rng))
+            rx = clamp(cx + r * cos(θ), 1.0, float(nx))
+            ry = clamp(cy + r * sin(θ), 1.0, float(ny))
+            push!(ridge_centers, [rx ry])
+            push!(ridge_heights, 1.5 + 3.5 * rand(rng))
+        end
+
+        push!(
+            volcanoes,
+            Dict{Symbol, Any}(
+                :center => [cx cy],
+                :cone_height => 6.0 + 6.0 * rand(rng),
+                :cone_spread => 1.0 / (2.0 * cone_radius^2),
+                :caldera_radius => caldera_radius,
+                :caldera_width => caldera_width,
+                :caldera_bonus => 3.0 + 5.0 * rand(rng),
+                :ridge_centers => ridge_centers,
+                :ridge_heights => ridge_heights,
+                :ridge_spread => 1.0 / (2.0 * (20.0 + 35.0 * rand(rng))^2),
+            ),
+        )
+    end
+
+    return volcanoes
+end
+
+function random_sites(field_size::Tuple{Int, Int}, count::Integer; rng = MersenneTwister(31))
+    nx, ny = field_size
+    return [[1.0 + (nx - 1.0) * rand(rng) 1.0 + (ny - 1.0) * rand(rng)] for _ in 1:count]
+end
+
+const VOLCANO_FIELD_SIZE = (1000, 1000)
+
 VOLCANO_ENV = Dict{Symbol, Any}(
-    :field_size => (10, 10),
+    :field_size => VOLCANO_FIELD_SIZE,
+    :cellsite_resolution => (35, 35),
     :horizon_steps => 12,
     :discount_factor => 0.97,
-    :step_size => 1.0,
-    :start_state => [2.0 2.0],
-    :peak_centers => [[5.0 5.0], [7.5 3.0], [3.0 7.5]],
-    :peak_heights => [10.0, 4.0, 3.5],
-    :peak_spread => 0.16,
-    :caldera_center => [5.0 5.0],
-    :caldera_radius => 2.2,
-    :caldera_width => 0.75,
-    :caldera_bonus => 7.0,
+    :step_size => 150.0,
+    :start_state => [50.0 50.0],
+    :volcanoes => random_volcanoes(VOLCANO_FIELD_SIZE, 50),
+    :gp_length_scale => 140.0,
     :base_risk => 0.02,
     :obstacle_risk_peak => 0.20,
-    :obstacle_risk_radius => 2.25,
-    :obstacle_risk_sigma => 0.85,
-    :obstacle_points => [[3.0 3.0], [7.0 6.0], [6.5 2.5]],
-    :elevation_threshold => 7.5,
-    :prior_sites => [[1.5 1.5], [1.5 8.5], [5.0 5.0], [8.5 1.5], [8.5 8.5]],
+    :obstacle_risk_radius => 90.0,
+    :obstacle_risk_sigma => 35.0,
+    :obstacle_points => random_sites(VOLCANO_FIELD_SIZE, 20; rng = MersenneTwister(41)),
+    :elevation_threshold => 7.0,
+    :prior_sites => [
+        [50.0 50.0],
+        [50.0 950.0],
+        [950.0 50.0],
+        [950.0 950.0],
+        random_sites(VOLCANO_FIELD_SIZE, 8; rng = MersenneTwister(47))...,
+    ],
 )
 
 function make_volcanic_elevation(env::Dict{Symbol, Any})
-    peak_centers = env[:peak_centers]
-    peak_heights = env[:peak_heights]
-    peak_spread = float(env[:peak_spread])
-    caldera_center = env[:caldera_center]
-    caldera_radius = float(env[:caldera_radius])
-    caldera_width = float(env[:caldera_width])
-    caldera_bonus = float(env[:caldera_bonus])
+    volcanoes = env[:volcanoes]
 
     function elevation(s)
         x = float(s[1])
         y = float(s[2])
 
         total = 0.0
-        for (i, c) in enumerate(peak_centers)
-            cx = float(c[1])
-            cy = float(c[2])
-            h = peak_heights[i]
-            total += h * exp(-peak_spread * ((x - cx)^2 + (y - cy)^2))
+        for volcano in volcanoes
+            center = volcano[:center]
+            cx = float(center[1])
+            cy = float(center[2])
+
+            cone_height = float(volcano[:cone_height])
+            cone_spread = float(volcano[:cone_spread])
+            total += cone_height * exp(-cone_spread * ((x - cx)^2 + (y - cy)^2))
+
+            caldera_distance = hypot(x - cx, y - cy)
+            caldera_radius = float(volcano[:caldera_radius])
+            caldera_width = float(volcano[:caldera_width])
+            caldera_bonus = float(volcano[:caldera_bonus])
+            total += caldera_bonus * exp(-((caldera_distance - caldera_radius)^2) / (2 * caldera_width^2))
+
+            ridge_centers = volcano[:ridge_centers]
+            ridge_heights = volcano[:ridge_heights]
+            ridge_spread = float(volcano[:ridge_spread])
+            for (i, ridge) in enumerate(ridge_centers)
+                rx = float(ridge[1])
+                ry = float(ridge[2])
+                total += ridge_heights[i] * exp(-ridge_spread * ((x - rx)^2 + (y - ry)^2))
+            end
         end
 
-        calx = float(caldera_center[1])
-        caly = float(caldera_center[2])
-        caldera_distance = hypot(x - calx, y - caly)
-        caldera = caldera_bonus * exp(-((caldera_distance - caldera_radius)^2) / (2 * caldera_width^2))
-        return total + caldera
+        return total
     end
     return elevation
 end
@@ -123,7 +182,8 @@ function VulcanJ.get_initial_gp(mdp::VolcanoSearchMDP, ::Matrix)
     # build X0 as 2×N matrix for GP inputs
     X0 = hcat([site' for site in prior_sites]...)
     y0 = [mdp.elevation_fn(site) for site in prior_sites]
-    return GPE(X0, y0, MeanZero(), SE(zeros(2), 0.0))
+    log_length_scale = log(float(mdp.env[:gp_length_scale]))
+    return GPE(X0, y0, MeanZero(), SE(fill(log_length_scale, 2), 0.0))
 end
 
 # How do we add observations?
@@ -187,7 +247,10 @@ VulcanJ.horizon(mdp::VolcanoSearchMDP) = mdp.env[:horizon_steps] # MCTS horizon
 
 function VulcanJ.cellsites(mdp::VolcanoSearchMDP)
     nx, ny = mdp.env[:field_size]
-    return [reshape([float(x), float(y)], 1, 2) for x in 1:nx for y in 1:ny]
+    rx, ry = get(mdp.env, :cellsite_resolution, mdp.env[:field_size])
+    xs = range(1.0, float(nx); length = rx)
+    ys = range(1.0, float(ny); length = ry)
+    return [reshape([float(x), float(y)], 1, 2) for x in xs for y in ys]
 end
 
 function volcano_search_solver(; rng = MersenneTwister(7))
@@ -228,6 +291,9 @@ path_plot = plot_simulated_path(result[1],
     path_observations;
     title = "Volcano Search Path",
     ground_truth_fn = (m, s) -> m.elevation_fn(s),
+    heatmap_resolution = 180,
+    marker_size = 3,
+    plot_size = (1200, 900),
     save_path = "/home/shashank/cbase/secondary/jbase/VulcanJ/examples/res/volcano_search_path.png"
 )
 
@@ -235,16 +301,30 @@ ergodic_gp = get_initial_gp(result[1], copy(result[1].env[:start_state]))
 ergodic_result = one_shot_ergodic_planner(
     result[1],
     ergodic_gp,
-    10;
+    100;
     initial_state = copy(result[1].env[:start_state]),
     rng = result[2].solver.rng,
+    max_speed = result[1].env[:step_size],
     observe_fn = (m, s) -> m.elevation_fn(s),
 )
+
+println("Ergodic target density statistics: ", ergodic_result.target_density_stats)
 
 ergodic_path_plot = plot_simulated_path(result[1],
     ergodic_result.states,
     ergodic_result.observations;
-    title = "Ergodic Information Path",
+    title = "Ergodic Search Path on Ground Truth",
     ground_truth_fn = (m, s) -> m.elevation_fn(s),
+    heatmap_resolution = 180,
+    marker_size = 2,
+    plot_size = (1200, 900),
+    save_path = "/home/shashank/cbase/secondary/jbase/VulcanJ/examples/res/ergodic_search_path.png"
+)
+
+ergodic_information_path_plot = plot_information_reward_path(result[1],
+    ergodic_result;
+    title = "Ergodic Information Path",
+    marker_size = 2,
+    plot_size = (1200, 900),
     save_path = "/home/shashank/cbase/secondary/jbase/VulcanJ/examples/res/ergodic_information_path.png"
 )

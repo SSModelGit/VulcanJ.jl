@@ -12,7 +12,8 @@ export RiskBoundedInfoMCTS,
        compute_kl_reward,
        one_shot_ergodic_planner,
        simulate_info_path,
-       plot_simulated_path
+       plot_simulated_path,
+       plot_information_reward_path
 
 ###############################################
 ## Packages used across multiple files
