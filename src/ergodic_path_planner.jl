@@ -1,17 +1,15 @@
 """
-    one_shot_ergodic_planner(mdp, gp, n_steps; kwargs...)
+    one_shot_ergodic_planner(mdp, model, n_steps; kwargs...)
 
 Plan a fixed path using a kernel ergodic-control objective.
 
-The target spatial distribution is built from expected information reward under the
-initial GP: for each cell, the planner compares the initial GP to the posterior formed
-by adding one synthetic measurement at that cell. During path construction the GP is
-not updated; a full trajectory is optimized so its occupation measure is ergodic with
-respect to the resulting information density.
+The target spatial distribution is built by asking the supplied environment
+model for expected information reward at each site. During path construction
+the model is not updated.
 """
 function one_shot_ergodic_planner(
     mdp::MDP,
-    gp::Any,
+    model::Any,
     n_steps::Integer;
     initial_state = nothing,
     rng = GLOBAL_RNG,
@@ -49,7 +47,8 @@ function one_shot_ergodic_planner(
     sites = collect(cellsites(mdp))
     isempty(sites) && throw(ArgumentError("mdp must provide at least one cellsite."))
 
-    info_rewards = [expected_single_observation_reward(mdp, gp, site, quad_order) for site in sites]
+    info_rewards =
+        [expected_single_observation_reward(mdp, model, site, quad_order) for site in sites]
     target_density = normalize_density(info_rewards)
     target_stats = density_statistics(target_density)
 
@@ -527,19 +526,8 @@ function infer_actions_from_path(mdp::MDP, states, rng::AbstractRNG)
     return actions_taken
 end
 
-function expected_single_observation_reward(mdp::MDP, gp::Any, state, quad_order::Integer)
-    μ, σ² = gp_predict(gp, state)
-    σ² = max(float(σ²), eps())
-    abscissae, weights = gausshermite(quad_order)
-
-    reward = 0.0
-    for j in eachindex(abscissae)
-        y = μ + sqrt(2 * σ²) * abscissae[j]
-        gp_posterior = add_obs_to_gp(state, y, gp)
-        reward += (weights[j] / sqrt(π)) * compute_kl_reward(gp, gp_posterior, mdp)
-    end
-    return max(reward, 0.0)
-end
+expected_single_observation_reward(mdp::MDP, model, state, quadrature_order::Integer) =
+    max(expected_information_gain(mdp, model, state, quadrature_order), 0.0)
 
 function normalize_density(weights::AbstractVector{<:Real})
     total = sum(weights)

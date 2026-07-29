@@ -7,50 +7,27 @@ export RiskBoundedInfoMCTS,
     build_search_tree,
     sample_rollout,
     select_action,
+    set_environment_model!,
+    initial_environment_model,
+    conditional_observation_distribution,
+    condition_environment_model,
+    expected_information_gain,
     initialize_gp_belief,
-       get_initial_gp,
-       compute_kl_reward,
-       one_shot_ergodic_planner,
-       simulate_info_path,
-       plot_simulated_path,
-       plot_information_reward_path
+    get_initial_gp,
+    compute_kl_reward,
+    one_shot_ergodic_planner,
+    simulate_info_path,
+    plot_simulated_path,
+    plot_information_reward_path
 
-###############################################
-## Packages used across multiple files
-
-### Quality-of-life packages (used throughout all files)
-using Reexport
-using Parameters: @with_kw, @with_kw_noshow
-using Match
-using ProgressMeter
-
-using Plots
-###
-
-### Below are packages used exclusively in the agent definitions (`intentional_*.jl` files)
-using GaussianProcesses, FastGaussQuadrature
+using Parameters: @with_kw
 using Random: AbstractRNG, GLOBAL_RNG
-using SpecialFunctions: erf
-using StatsBase: Weights, sample
-using LinearAlgebra: normalize, ⋅, norm
-using Distributions: Normal, MvNormal
-
-using POMDPs, POMDPTools
-
-# Register required functions with POMDPTools if available (best-effort).
-# This intentionally does not provide fallbacks —
-# missing functions should raise clear errors so implementers know what to provide.
-# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_initial_gp)
-# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :add_obs_to_gp)
-# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :get_failure_prob)
-# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :posterior_phenomenon_prob)
-# POMDPTools.add_requirement(RiskBoundedInfoMCTS, :horizon)
+using POMDPs
+import Plots
 
 export get_initial_gp, add_obs_to_gp, get_failure_prob, posterior_phenomenon_prob, cellsites, horizon
 
-using MuKumari
-###
-###############################################
+include("environment_model.jl")
 
 # ============================================================================
 # Solver Definition
@@ -60,7 +37,7 @@ using MuKumari
     # Planning parameters
     lookahead::Int              # planning horizon H per solve call
     time_budget::Float64        # planning time limit τ (seconds)
-    quad_order::Int             # Gauss-Hermite quadrature order J (e.g., 5)
+    quad_order::Int             # built-in GP quadrature order or model accuracy hint
 
     # Risk and reward parameters
     risk_budget::Float64        # total risk budget Δ
@@ -71,7 +48,6 @@ using MuKumari
     # RNG
     rng::AbstractRNG
 end
-
 
 # ============================================================================
 # Policy Definition (stores computed tree and values)
@@ -84,7 +60,7 @@ end
 
     # Tree bookkeeping
     tree_nodes::Dict             # state → node_metadata
-    node_gps::Dict               # state → gp_posterior  
+    node_models::Dict            # state → opaque environment model
     best_action::Dict            # state → action
 
     # Running statistics
@@ -130,13 +106,29 @@ function POMDPs.solve(solver::RiskBoundedInfoMCTS, mdp::MDP)
         mdp = mdp,
         mdp_state_type = statetype(mdp),
         tree_nodes = Dict(),
-        node_gps = Dict(),
+        node_models = Dict(),
         best_action = Dict(),
         risk_used = 0.0,
         info_gained = 0.0,
         time_step = 0,
     )
 
+    return policy
+end
+
+"""
+    set_environment_model!(policy, state, model)
+
+Set the opaque environment model for the next planning query at `state`. The
+cached search tree and actions are invalidated because they depend on the
+previous model.
+"""
+function set_environment_model!(policy::RiskBoundedInfoPolicy, state, model)
+    nodekey = initialize_nodekey(state)
+    empty!(policy.tree_nodes)
+    empty!(policy.node_models)
+    empty!(policy.best_action)
+    policy.node_models[nodekey] = model
     return policy
 end
 
@@ -183,12 +175,12 @@ function build_search_tree(policy::RiskBoundedInfoPolicy, initial_state::Any)
     policy.tree_nodes[initial_nodekey] =
         TreeNode(visits = 0, action_values = Dict(), action_counts = Dict(), actions_tried = Set())
 
-    # Retrieve or initialize GP belief at initial state
-    if initial_nodekey ∉ keys(policy.node_gps)
-        policy.node_gps[initial_nodekey] = initialize_gp_belief(mdp, initial_state)
+    # Retrieve an injected model or initialize one through the model interface.
+    if initial_nodekey ∉ keys(policy.node_models)
+        policy.node_models[initial_nodekey] = initial_environment_model(mdp, initial_state)
     end
 
-    initial_gp = policy.node_gps[initial_nodekey]
+    initial_model = policy.node_models[initial_nodekey]
 
     # Run MCTS iterations for time budget
     start_time = time()
@@ -198,8 +190,8 @@ function build_search_tree(policy::RiskBoundedInfoPolicy, initial_state::Any)
         _ = sample_rollout(
             policy,
             initial_nodekey,
-            initial_gp,
-            policy.time_step,
+            initial_model,
+            0,
             solver.lookahead,
             policy.risk_used,
             0.0,
@@ -228,7 +220,7 @@ end
 function sample_rollout(
     policy::RiskBoundedInfoPolicy,
     nodekey::Any,
-    gp::Any,
+    model::Any,
     depth::Int,
     horizon_end::Int,
     risk_accum::Real,
@@ -239,38 +231,17 @@ function sample_rollout(
     solver = policy.solver
     state = nodekey.state
 
-    ### OBSERVATION ESTIMATION VIA GAUSS-HERMITE QUADRATURE
-    (μ, σ²) = gp_predict(gp, state)  # GP mean and variance at current state
-
-    abscissae, weights = gausshermite(solver.quad_order)
-
-    expected_info_delta = 0.0
-    for j in eachindex(abscissae)
-        # synthetic observation
-        y_j = sqrt(2 * σ²) * abscissae[j] + μ
-
-        # Condition on this observation
-        gp_tmp = add_obs_to_gp(state, y_j, gp)
-
-        # Compute KL divergence (reward for this measurement)
-        kl_j = compute_kl_reward(gp, gp_tmp, mdp)
-
-        # Accumulate weighted (Fast Gauss-Hermite formula uses sqrt(pi))
-        expected_info_delta += (weights[j] / sqrt(π)) * kl_j
-    end
-
-    info_here = info_accum + expected_info_delta
-
-    # Terminal condition: reached planning horizon
-    if depth == horizon_end
-        return info_here  # return cumulative info as leaf value
+    # A rollout step represents one future action and its successor
+    # observation. The root model already contains the current observation.
+    if depth >= horizon_end
+        return info_accum
     end
 
     # Get or initialize node metadata
     if nodekey ∉ keys(policy.tree_nodes)
         policy.tree_nodes[nodekey] =
             TreeNode(visits = 0, action_values = Dict(), action_counts = Dict(), actions_tried = Set())
-        policy.node_gps[nodekey] = gp
+        policy.node_models[nodekey] = model
     end
 
     node = policy.tree_nodes[nodekey]
@@ -289,13 +260,6 @@ function sample_rollout(
         node.action_values[action] = 0.0
     end
 
-    # Select one quadrature branch to use for the recursive GP update
-    wsum = sum(weights)
-    probs = (weights ./ (wsum > 0 ? wsum : 1.0))
-    idx = sample(Weights(probs))
-    y_selected = sqrt(2 * σ²) * abscissae[idx] + μ
-    gp_for_recursion = add_obs_to_gp(state, y_selected, gp)
-
     # TRANSITION & RISK CHECK
     # Sample next state (conditioned on no collision)
     s_next = next_state(mdp, state, action, policy.solver.rng)
@@ -305,15 +269,26 @@ function sample_rollout(
 
     risk_next = risk_accum + delta_k
 
+    # Evaluate and condition at the successor state. VulcanJ only invokes the
+    # supplied model interface; it does not inspect the distribution or model.
+    expected_info_delta =
+        expected_information_gain(mdp, model, s_next, solver.quad_order)
+    observation_distribution =
+        conditional_observation_distribution(mdp, model, s_next)
+    observation = rand(solver.rng, observation_distribution)
+    model_for_recursion =
+        condition_environment_model(mdp, model, s_next, observation)
+    info_next = info_accum + expected_info_delta
+
     # RECURSE
     result = sample_rollout(
         policy,
-        successor_nodekey(nodekey, s_next, y_selected),
-        gp_for_recursion,
+        successor_nodekey(nodekey, s_next, observation),
+        model_for_recursion,
         depth + 1,
         horizon_end,
         risk_next,
-        info_here,
+        info_next,
         risk_allowed,
     )
 
@@ -410,40 +385,10 @@ function compute_performance_guided_bound(
 end
 
 
-function gp_predict(gp::Any, state::Any)
-    # Extract location from state; predict mean and variance
-    # Returns (μ::Float, σ²::Float)
-    location = extract_location(state)
-    (mu, sigma2) = predict_f(gp, location')
-    # since predicting over only one state we know dimensionality of vec to be 1x1 per each
-    return (mu[1], sigma2[1])
-end
-
-
-function compute_kl_reward(gp_prior::Any, gp_posterior::Any, mdp::Any)
-    # Sum KL divergences between posteriors for each phenomenon variable
-    # ∑_i D_KL( p(X_i | posterior) || p(X_i | prior) )
-    kl_sum = 0.0
-    for s in cellsites(mdp)
-        p_prior = posterior_phenomenon_prob(mdp, gp_prior, s)
-        p_post = posterior_phenomenon_prob(mdp, gp_posterior, s)
-        kl_sum += kl_divergence(p_post, p_prior)
-    end
-    return kl_sum
-end
-
-
 function collision_probability(mdp::Any, state::Any, action::Any)
     # Return P[C_{k+1} | state, action]
     # Expect the MDP to implement `get_failure_prob(mdp, state, action)`.
     return get_failure_prob(mdp, state, action)
-end
-
-
-function initialize_gp_belief(mdp::Any, state::Any)
-    # Initialize and return a GP belief for the environment
-    # Expect the MDP to implement `get_initial_gp(mdp, state)`.
-    return get_initial_gp(mdp, state)
 end
 
 
@@ -458,34 +403,6 @@ function next_state(mdp::Any, state::Any, action::Any, rng::AbstractRNG)
     end
 end
 
-
-last_observation_location(gp::Any) = reshape(gp.x[:, end:end], 1, :)
-
-
-function gp_predictive_kl(gp_prior::Any, gp_posterior::Any)
-    # Gaussian fallback: KL between scalar predictive normals at the last location.
-    μ1, σ1² = predictive_moments(gp_prior)
-    μ2, σ2² = predictive_moments(gp_posterior)
-    σ1² = max(σ1², eps())
-    σ2² = max(σ2², eps())
-    return 0.5 * (log(σ2² / σ1²) + (σ1² + (μ1 - μ2)^2) / σ2² - 1)
-end
-
-
-function predictive_moments(gp::Any)
-    X = last_observation_location(gp)
-    μ, Σ = predict_f(gp, X')
-    return first(vec(μ)), first(vec(Σ))
-end
-
-
-function initial_gp_from_state(mdp::Any, state::Any)
-    dim = observation_dim(mdp, state)
-    return GPE(Matrix{Float64}(undef, dim, 0), Float64[], MeanZero(), SE(zeros(dim), 0.0))
-end
-
-
-observation_dim(mdp::Any, state::Any) = size(extract_location(state), 2)
 
 extract_location(state::Any) =
     state isa AbstractArray ? reshape(Float64.(state), 1, :) : reshape([Float64(state)], 1, :)
@@ -505,12 +422,16 @@ function get_failure_prob(mdp::Any, s::Any, a::Any)
 end
 
 function get_initial_gp(mdp::Any, s::Any)
-    error("MDP must implement `get_initial_gp(mdp, s)` to return initial GP belief.")
+    error(
+        "The MDP must implement `initial_environment_model(mdp, s)`, or define " *
+        "`get_initial_gp(mdp, s)` to use VulcanJ's built-in GP model.",
+    )
 end
 
 function posterior_phenomenon_prob(mdp, gp, s)
     error(
-        "MDP must implement `posterior_phenomenon_prob(gp, idx)` to return probability of phenomenon at index.",
+        "The built-in GP model requires " *
+        "`posterior_phenomenon_prob(mdp, model, site)`.",
     )
 end
 
@@ -523,7 +444,10 @@ function horizon(mdp::Any)
 end
 
 function add_obs_to_gp(X::Any, y::Any, gp::Any)
-    error("MDP must implement `add_obs_to_gp(X, y, gp)` to return updated GP with new observation.")
+    error(
+        "The integration must implement `condition_environment_model`, or define " *
+        "`add_obs_to_gp` to use VulcanJ's built-in GP model.",
+    )
 end
 
 include("ergodic_path_planner.jl")

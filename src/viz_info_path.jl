@@ -7,8 +7,8 @@ Simulate `n_steps` actions of an agent controlled by a Vulcan policy.
 each executed action. The returned coordinate vectors include the initial location,
 so their length is `n_steps + 1`; the observations vector has the same length.
 
-When `update_belief` is true, each real observation is inserted into the GP belief
-used to plan the next action.
+When `update_model` is true, each real observation is passed to the supplied
+environment model's conditioning function before the next planning query.
 """
 function simulate_info_path(
     mdp::MDP,
@@ -16,29 +16,29 @@ function simulate_info_path(
     observe_fn::Function,
     n_steps::Integer;
     initial_state = nothing,
-    update_belief::Bool = true,
+    update_model::Bool = true,
 )
-    state = isnothing(initial_state) ? rand(solver.rng, initialstate(mdp)) : copy(initial_state)
-    current_gp = initialize_gp_belief(mdp, state)
+    state = isnothing(initial_state) ? rand(policy.solver.rng, initialstate(mdp)) : copy(initial_state)
+    current_model = initial_environment_model(mdp, state)
 
     state_vec = Any[]
     observations = Any[]
 
     obs = record_visit!(state_vec, observations, mdp, observe_fn, state)
-    if update_belief
-        ;
-        current_gp = add_obs_to_gp(state, obs, current_gp);
+    if update_model
+        current_model = condition_environment_model(mdp, current_model, state, obs)
     end
+    set_environment_model!(policy, state, current_model)
 
     for _ in 1:n_steps
         a = action(policy, state)
         state = next_state(mdp, state, a, policy.solver.rng)
 
         obs = record_visit!(state_vec, observations, mdp, observe_fn, state)
-        if update_belief
-            ;
-            current_gp = add_obs_to_gp(state, obs, current_gp);
+        if update_model
+            current_model = condition_environment_model(mdp, current_model, state, obs)
         end
+        set_environment_model!(policy, state, current_model)
     end
 
     return state_vec, observations
