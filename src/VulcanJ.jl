@@ -16,6 +16,7 @@ export RiskBoundedInfoMCTS,
     get_initial_gp,
     compute_kl_reward,
     one_shot_ergodic_planner,
+    kernel_ergodic_trajectory,
     simulate_info_path,
     plot_simulated_path,
     plot_information_reward_path
