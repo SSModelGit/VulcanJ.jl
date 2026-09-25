@@ -1,3 +1,6 @@
 /Manifest.toml
 literature/
 .vscode
+
+/examples/Manifest.toml
+integrations/

@@ -1,58 +1,5 @@
-"""
-    simulate_info_path(mdp, solver, observe_fn, n_steps; initial_state=nothing, update_belief=true)
-
-Simulate `n_steps` actions of an agent controlled by a Vulcan policy.
-
-`observe_fn` is called as `observe_fn(mdp, state)` at the initial state and after
-each executed action. The returned coordinate vectors include the initial location,
-so their length is `n_steps + 1`; the observations vector has the same length.
-
-When `update_model` is true, each real observation is passed to the supplied
-environment model's conditioning function before the next planning query.
-"""
-function simulate_info_path(
-    mdp::MDP,
-    policy::RiskBoundedInfoPolicy,
-    observe_fn::Function,
-    n_steps::Integer;
-    initial_state = nothing,
-    update_model::Bool = true,
-)
-    state = isnothing(initial_state) ? rand(policy.solver.rng, initialstate(mdp)) : copy(initial_state)
-    current_model = initial_environment_model(mdp, state)
-
-    state_vec = Any[]
-    observations = Any[]
-
-    obs = record_visit!(state_vec, observations, mdp, observe_fn, state)
-    if update_model
-        current_model = condition_environment_model(mdp, current_model, state, obs)
-    end
-    set_environment_model!(policy, state, current_model)
-
-    for _ in 1:n_steps
-        a = action(policy, state)
-        state = next_state(mdp, state, a, policy.solver.rng)
-
-        obs = record_visit!(state_vec, observations, mdp, observe_fn, state)
-        if update_model
-            current_model = condition_environment_model(mdp, current_model, state, obs)
-        end
-        set_environment_model!(policy, state, current_model)
-    end
-
-    return state_vec, observations
-end
-
-function record_visit!(state_vec::Vector, observations::Vector, mdp::MDP, observe_fn::Function, state)
-    push!(state_vec, state)
-    obs = observe_fn(mdp, state)
-    push!(observations, obs)
-    return obs
-end
-
 function plot_simulated_path(
-    mdp::MDP,
+    mdp::Union{MDP,POMDP},
     state_vec::Vector,
     observations::Vector;
     title = "Simulated Explorative Path",
@@ -60,13 +7,20 @@ function plot_simulated_path(
     observation_fn::Union{Function, Nothing} = ground_truth_fn,
     save_path = nothing,
     heatmap_resolution::Integer = 100,
+    bounds = nothing,
+    colorbar_title = "Ground Truth",
+    obstacles = (),
+    obstacle_alpha = 1.0,
+    obstacle_label = "Obstacle",
     marker_size::Integer = 4,
     plot_size::Tuple{Int, Int} = (1000, 800),
 )
     xs, ys = path_coordinates(state_vec)
 
     if !isnothing(observation_fn)
-        xgrid, ygrid = heatmap_grid(mdp, xs, ys, heatmap_resolution)
+        xgrid, ygrid = isnothing(bounds) ? heatmap_grid(mdp, xs, ys, heatmap_resolution) :
+            (range(bounds.xmin,bounds.xmax;length=heatmap_resolution),
+             range(bounds.ymin,bounds.ymax;length=heatmap_resolution))
         z = [call_observation_fn(observation_fn, mdp, reshape([x, y], 1, 2)) for y in ygrid, x in xgrid]
         fig = Plots.heatmap(
             xgrid,
@@ -75,7 +29,7 @@ function plot_simulated_path(
             title = title,
             xlabel = "x",
             ylabel = "y",
-            colorbar_title = "Ground Truth",
+            colorbar_title,
             aspect_ratio = :equal,
             legend = :topright,
             size = plot_size,
@@ -91,11 +45,19 @@ function plot_simulated_path(
         )
     end
 
+    for polygon in obstacles
+        Plots.plot!(fig,Plots.Shape(first.(polygon),last.(polygon));
+            label=obstacle_label,color=:gray,fillalpha=obstacle_alpha)
+    end
+    if !isnothing(bounds)
+        Plots.plot!(fig;xlims=(bounds.xmin,bounds.xmax),ylims=(bounds.ymin,bounds.ymax))
+    end
+
     Plots.plot!(
         fig,
         xs,
         ys;
-        label = "Simulated Path",
+        label = "Path",
         color = :red,
         linewidth = 2,
         linestyle = :dot,
@@ -106,6 +68,7 @@ function plot_simulated_path(
     )
 
     if !isnothing(save_path)
+        mkpath(dirname(save_path))
         Plots.savefig(fig, save_path)
     end
     return fig
@@ -121,7 +84,7 @@ Plot a path over the spatial information reward field used by the ergodic planne
 `ergodic_result.information_rewards`.
 """
 function plot_information_reward_path(
-    mdp::MDP,
+    mdp::Union{MDP,POMDP},
     state_vec::Vector,
     sites::Vector,
     rewards::AbstractVector{<:Real};
@@ -130,7 +93,7 @@ function plot_information_reward_path(
     marker_size::Integer = 4,
     plot_size::Tuple{Int, Int} = (1000, 800),
     colorbar_title = "Information Reward",
-    path_label = "Simulated Path",
+    path_label = "Path",
     reward_scale::Symbol = :log,
     quantile_clip::Real = 0.98,
 )
@@ -170,13 +133,14 @@ function plot_information_reward_path(
     )
 
     if !isnothing(save_path)
+        mkpath(dirname(save_path))
         Plots.savefig(fig, save_path)
     end
     return fig
 end
 
 function plot_information_reward_path(
-    mdp::MDP,
+    mdp::Union{MDP,POMDP},
     ergodic_result;
     use_normalized_density::Bool = true,
     colorbar_title::Union{String, Nothing} = nothing,
@@ -207,7 +171,7 @@ function path_coordinates(state_vec::Vector)
     return xs, ys
 end
 
-function heatmap_grid(mdp::MDP, xs::Vector{Float64}, ys::Vector{Float64}, resolution::Integer)
+function heatmap_grid(mdp::Union{MDP,POMDP}, xs::Vector{Float64}, ys::Vector{Float64}, resolution::Integer)
     resolution < 2 && throw(ArgumentError("heatmap_resolution must be at least 2."))
 
     if hasproperty(mdp, :env) && haskey(mdp.env, :field_size)
@@ -281,7 +245,7 @@ function empirical_quantile(sorted_values::Vector{Float64}, q::Float64)
     return (1 - α) * sorted_values[lo] + α * sorted_values[hi]
 end
 
-function call_observation_fn(observation_fn::Function, mdp::MDP, state)
+function call_observation_fn(observation_fn::Function, mdp::Union{MDP,POMDP}, state)
     if applicable(observation_fn, mdp, state)
         return observation_fn(mdp, state)
     else

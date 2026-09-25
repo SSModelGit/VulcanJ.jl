@@ -1,5 +1,5 @@
 """
-    one_shot_ergodic_planner(mdp, model, n_steps; kwargs...)
+    ergodic_reference_path(mdp, model, n_steps; kwargs...)
 
 Plan a fixed path using a kernel ergodic-control objective.
 
@@ -7,8 +7,8 @@ The target spatial distribution is built by asking the supplied environment
 model for expected information reward at each site. During path construction
 the model is not updated.
 """
-function one_shot_ergodic_planner(
-    mdp::MDP,
+function ergodic_reference_path(
+    mdp::Union{MDP,POMDP},
     model::Any,
     n_steps::Integer;
     initial_state = nothing,
@@ -29,6 +29,11 @@ function one_shot_ergodic_planner(
     line_search_steps::Integer = 8,
     line_search_decay::Real = 0.5,
     observe_fn::Union{Function, Nothing} = nothing,
+    objective = LegacyInformation(),
+    history = (),
+    infer_actions = true,
+    initial_controls = nothing,
+    dynamics_problem = mdp,
 )
     n_steps < 0 && throw(ArgumentError("n_steps must be nonnegative."))
     quad_order < 1 && throw(ArgumentError("quad_order must be positive."))
@@ -48,7 +53,7 @@ function one_shot_ergodic_planner(
     isempty(sites) && throw(ArgumentError("mdp must provide at least one cellsite."))
 
     info_rewards =
-        [expected_single_observation_reward(mdp, model, site, quad_order) for site in sites]
+        [max(expected_information_gain(objective, mdp, model, site, quad_order), 0.0) for site in sites]
     target_density = normalize_density(info_rewards)
     target_stats = density_statistics(target_density)
 
@@ -56,7 +61,7 @@ function one_shot_ergodic_planner(
     bounds = coordinate_bounds(site_points)
 
     if backend == :kernel
-        path_points, controls, loss_history, kernel_metric_history = kernel_ergodic_trajectory(
+        path_points, controls, loss_history, kernel_metric_history = optimize_ergodic_trajectory(
             point_tuple(state),
             site_points,
             target_density,
@@ -73,9 +78,10 @@ function one_shot_ergodic_planner(
             max_speed = isnothing(max_speed) ? nothing : Float64(max_speed),
             line_search_steps = line_search_steps,
             line_search_decay = Float64(line_search_decay),
+            history, initial_controls,
         )
         states = [point_state(p) for p in path_points]
-        actions_taken = infer_actions_from_path(mdp, states, rng)
+        actions_taken = infer_actions ? infer_actions_from_path(dynamics_problem, states, rng, objective) : Any[]
         observations = Any[]
         !isnothing(observe_fn) &&
             append!(observations, [call_ergodic_observe(observe_fn, mdp, s) for s in states])
@@ -106,7 +112,7 @@ function one_shot_ergodic_planner(
     observations = Any[]
     !isnothing(observe_fn) && push!(observations, call_ergodic_observe(observe_fn, mdp, state))
 
-    path_points = Tuple{Float64, Float64}[point_tuple(state)]
+    path_points = isempty(history) ? Tuple{Float64, Float64}[point_tuple(state)] : collect(history)
 
     for _ in 1:n_steps
         isterminal(mdp, state) && break
@@ -119,7 +125,7 @@ function one_shot_ergodic_planner(
         best_score = Inf
 
         for a in feasible_actions
-            candidate_state = next_state(mdp, state, a, rng)
+            candidate_state = next_state(dynamics_problem, state, a, rng)
             candidate_points = [path_points; point_tuple(candidate_state)]
             coeffs = trajectory_coefficients(candidate_points, modes, bounds)
             score = ergodic_metric(coeffs, target_coeffs, lambda)
@@ -153,7 +159,7 @@ function one_shot_ergodic_planner(
     )
 end
 
-function kernel_ergodic_trajectory(
+function optimize_ergodic_trajectory(
     start::Tuple{Float64, Float64},
     sites::Vector{Tuple{Float64, Float64}},
     density::AbstractVector{<:Real},
@@ -170,6 +176,8 @@ function kernel_ergodic_trajectory(
     max_speed::Union{Float64, Nothing},
     line_search_steps::Integer,
     line_search_decay::Float64,
+    history = (),
+    initial_controls = nothing,
 )
     n_steps == 0 && return ([start], zeros(Float64, 0, 2), Float64[], Float64[])
 
@@ -177,11 +185,19 @@ function kernel_ergodic_trajectory(
     unit_start = normalize_point(start, bounds)
     unit_sites = [normalize_point(site, bounds) for site in sites]
     site_matrix = points_matrix(unit_sites)
+    past = points_matrix(Tuple{Float64,Float64}[normalize_point(p, bounds) for p in history])
     weights = Float64.(density)
     density_sigma = default_normalized_bandwidth(bounds, density_bandwidth, 0.075)
     kernel_sigma = default_normalized_bandwidth(bounds, kernel_bandwidth, 0.050)
     unit_max_speed = isnothing(max_speed) ? nothing : Float64(max_speed) / max(bounds.xspan, bounds.yspan)
     controls = initialize_kernel_controls(unit_start, site_matrix, weights, unit_bounds, n_steps, dt, unit_max_speed)
+
+    if !isnothing(initial_controls)
+        controls .= initial_controls
+        controls[:, 1] ./= bounds.xspan
+        controls[:, 2] ./= bounds.yspan
+        project_controls!(controls, unit_max_speed)
+    end
 
     loss_history = Float64[]
     kernel_metric_history = Float64[]
@@ -200,6 +216,7 @@ function kernel_ergodic_trajectory(
             dt,
             control_weight,
             boundary_weight,
+            past,
         )
         push!(loss_history, cost)
         push!(kernel_metric_history, metric)
@@ -227,6 +244,7 @@ function kernel_ergodic_trajectory(
                 dt,
                 control_weight,
                 boundary_weight,
+                past,
             )
             if candidate_cost <= cost
                 controls .= candidate
@@ -256,11 +274,19 @@ function kernel_ergodic_loss(
     dt::Float64,
     control_weight::Float64,
     boundary_weight::Float64,
+    past::Matrix{Float64} = zeros(0, 2),
 )
     n = size(traj, 1)
     density_total = sum(kde_density(view(traj, i, :), sites, weights, density_sigma) for i in axes(traj, 1))
     kernel_mean = trajectory_kernel_mean(traj, kernel_sigma)
     metric = -2.0 * density_total / n + kernel_mean
+    if !isempty(past)
+        N = n + size(past, 1)
+        cross = sum(gaussian_kernel_value(traj[i,1] - past[j,1],
+            traj[i,2] - past[j,2], kernel_sigma)
+            for i in axes(traj,1), j in axes(past,1))
+        metric = -2.0 * density_total / N + (kernel_mean * n^2 + 2cross) / N^2
+    end
     effort = control_weight * dt * sum(abs2, controls)
     boundary = boundary_weight * boundary_penalty(traj, bounds)
     return metric + effort + boundary
@@ -277,15 +303,17 @@ function kernel_ergodic_loss_gradient(
     dt::Float64,
     control_weight::Float64,
     boundary_weight::Float64,
+    past::Matrix{Float64} = zeros(0, 2),
 )
     n = size(traj, 1)
+    N = n + size(past, 1)
     grad_x = zeros(Float64, n, 2)
     density_sum = 0.0
 
     for i in 1:n
         x = view(traj, i, :)
         density_sum += kde_density(x, sites, weights, density_sigma)
-        grad_x[i, :] .-= (2.0 / n) .* kde_density_gradient(x, sites, weights, density_sigma)
+        grad_x[i, :] .-= (2.0 / N) .* kde_density_gradient(x, sites, weights, density_sigma)
     end
 
     kernel_sum = 0.0
@@ -295,7 +323,16 @@ function kernel_ergodic_loss_gradient(
         dy = traj[j, 2] - traj[i, 2]
         kval = gaussian_kernel_value(dx, dy, kernel_sigma)
         kernel_sum += kval
-        scale = (2.0 / (n * n)) * kval * inv_kernel_var
+        scale = (2.0 / (N * N)) * kval * inv_kernel_var
+        grad_x[i, 1] += scale * dx
+        grad_x[i, 2] += scale * dy
+    end
+
+    for i in 1:n, j in axes(past, 1)
+        dx, dy = past[j, 1] - traj[i, 1], past[j, 2] - traj[i, 2]
+        kval = gaussian_kernel_value(dx, dy, kernel_sigma)
+        kernel_sum += 2 * kval
+        scale = (2.0 / (N * N)) * kval * inv_kernel_var
         grad_x[i, 1] += scale * dx
         grad_x[i, 2] += scale * dy
     end
@@ -311,7 +348,7 @@ function kernel_ergodic_loss_gradient(
         grad_u[t, :] .= dt .* running .+ 2.0 * control_weight * dt .* controls[t, :]
     end
 
-    metric = -2.0 * density_sum / n + kernel_sum / (n * n)
+    metric = -2.0 * density_sum / N + kernel_sum / (N * N)
     cost = metric + control_weight * dt * sum(abs2, controls) + boundary_weight * boundary_penalty(traj, bounds)
     return cost, grad_u, metric
 end
@@ -440,14 +477,6 @@ function clamp_matrix_to_bounds!(path::Matrix{Float64}, bounds)
     return path
 end
 
-function default_bandwidth(bounds, bandwidth::Union{Real, Nothing}, scale::Real)
-    if isnothing(bandwidth)
-        return Float64(scale * max(min(bounds.xspan, bounds.yspan), eps()) / 10)
-    end
-    bandwidth <= 0 && throw(ArgumentError("kernel bandwidths must be positive."))
-    return Float64(bandwidth)
-end
-
 function default_normalized_bandwidth(bounds, bandwidth::Union{Real, Nothing}, default_value::Real)
     if isnothing(bandwidth)
         return Float64(default_value)
@@ -500,34 +529,35 @@ function density_statistics(density::AbstractVector{<:Real})
     )
 end
 
-function infer_actions_from_path(mdp::MDP, states, rng::AbstractRNG)
-    actions_taken = Any[]
-    length(states) <= 1 && return actions_taken
-    for i in 1:(length(states) - 1)
-        feasible = collect(actions(mdp, states[i]))
-        if isempty(feasible)
-            push!(actions_taken, nothing)
-            continue
+function select_action(problem, state, target, rng::AbstractRNG)
+    feasible = collect(actions(problem, state))
+    isempty(feasible) && return nothing
+    target_point = point_tuple(target)
+    best_action, best_dist = first(feasible), Inf
+    for a in feasible
+        candidate = next_state(problem, state, a, rng)
+        cp = point_tuple(candidate)
+        dist = hypot(cp[1] - target_point[1], cp[2] - target_point[2])
+        if dist < best_dist
+            best_dist, best_action = dist, a
         end
-        target = point_tuple(states[i + 1])
-        best_action = first(feasible)
-        best_dist = Inf
-        for a in feasible
-            candidate = next_state(mdp, states[i], a, rng)
-            cp = point_tuple(candidate)
-            dist = hypot(cp[1] - target[1], cp[2] - target[2])
-            if dist < best_dist
-                best_dist = dist
-                best_action = a
-            end
-        end
-        push!(actions_taken, best_action)
     end
-    return actions_taken
+    return best_action
 end
 
+select_action(objective, problem, state, target, rng::AbstractRNG) =
+    select_action(problem, state, target, rng)
+
+# Legacy action inference used gen, including its measurement RNG draws.
+# New integration adapters can instead specialize physical-only selection.
+select_action(::LegacyInformation, problem, state, target, rng::AbstractRNG) =
+    invoke(select_action, Tuple{Any,Any,Any,AbstractRNG}, problem, state, target, rng)
+
+infer_actions_from_path(problem, states, rng::AbstractRNG, objective) =
+    Any[select_action(objective, problem, states[i], states[i+1], rng) for i in 1:length(states)-1]
+
 expected_single_observation_reward(mdp::MDP, model, state, quadrature_order::Integer) =
-    max(expected_information_gain(mdp, model, state, quadrature_order), 0.0)
+    max(expected_information_gain(LegacyInformation(), mdp, model, state, quadrature_order), 0.0)
 
 function normalize_density(weights::AbstractVector{<:Real})
     total = sum(weights)
